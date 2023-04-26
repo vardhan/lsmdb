@@ -1,7 +1,9 @@
 use std::{
     cmp::Ordering,
     collections::{btree_map::Range, BTreeMap},
+    io::{Read, Seek, Write},
     iter::Peekable,
+    mem::size_of,
     ops::Bound,
     path::{Path, PathBuf},
 };
@@ -30,11 +32,13 @@ impl Entry {
 
 const MEMTABLE_MAX_SIZE_BYTES: usize = 1024 * 1024 * 1; // 1 MB size threshold
 
+type Memtable = BTreeMap<Key, Entry>;
+
 pub struct DB {
     root_path: PathBuf,
 
-    memtable: BTreeMap<Key, Entry>,
-    memtable_frozen: Option<BTreeMap<Key, Entry>>,
+    memtable: Memtable,
+    memtable_frozen: Option<Memtable>,
 
     // number of bytes that memtable has taken up so far
     // accounts for key and value size.
@@ -118,7 +122,102 @@ impl DB {
     fn _swap_and_compact(&mut self) {
         assert!(self.memtable_frozen.is_none());
         self.memtable_frozen = Some(std::mem::take(&mut self.memtable));
+
+        // flush memtable to sstable
+        let mut file = std::fs::File::create(self.root_path.join("sstable")).expect("create file");
+        self.flush_memtable(self.memtable_frozen.as_ref().unwrap(), &mut file)
+            .expect("flush table");
     }
+
+    fn flush_memtable(
+        &self,
+        memtable: &Memtable,
+        writer: &mut dyn Write,
+    ) -> Result<(), std::io::Error> {
+        let mut block_writer = BlockWriter::new();
+        let mut block_indices: Vec<(usize, String)> = Vec::new();
+
+        // write out all the keys
+        for (key, entry) in memtable {
+            match block_writer.add_to_block(key, entry) {
+                Ok(()) => {}
+                Err(BlockWriterError::BlockSizeOverflow) => {
+                    block_indices.push(block_writer.write(writer)?);
+                    block_writer = BlockWriter::new();
+                    block_writer
+                        .add_to_block(key, entry)
+                        .expect("single key/value won't fit in block");
+                }
+                Err(BlockWriterError::Io(err)) => return Err(err),
+            }
+        }
+
+        block_indices.push(block_writer.write(writer)?);
+
+        // write out the sstable index:
+        // - block #1 byte offset (4 bytes), key length (4 bytes), key (variable length)
+        // - block #2 ..
+        // - ..
+        // - byte offset of sstable index
+        let mut block_offset = 0u32; // sstable index offset by the time the following loop is done.
+        for (block_size, last_key) in block_indices {
+            writer.write(&block_offset.to_le_bytes())?;
+            writer.write(&(last_key.len() as u32).to_le_bytes())?;
+            writer.write(last_key.as_bytes())?;
+            block_offset += block_size as u32;
+        }
+        writer.write(&block_offset.to_be_bytes())?;
+
+        Ok(())
+    }
+}
+
+struct SSTableReader<T: Read + Seek> {
+    reader: T,
+
+    // (last_key, block byte offset, block size), sorted by last_key.
+    index: Vec<(String, u32, u32)>,
+}
+type BlockIndex = u32;
+impl<T: Read + Seek> SSTableReader<T> {
+    fn from_reader(reader: T) -> Result<Self, std::io::Error> {
+        // parse sstable index into `index`
+        Ok(SSTableReader {
+            reader,
+            index: Vec::new(),
+        })
+    }
+
+    fn get(&self, key: String) -> Result<Entry> {
+        let block_index = self.get_candidate_block(key);
+        let block_reader = self.read_block(block_index);
+        block_reader.get(key)
+    }
+
+    // given a key, returns which block # might contain the key value pair
+    fn get_candidate_block(&self, key: String) -> BlockIndex {
+        match self
+            .index
+            .binary_search_by_key(&&key, |(last_key, _, _)| last_key)
+        {
+            // FIXME:  should fail if key is past the last block.
+            Ok(idx) | Err(idx) => {
+                // Found in this block.
+                self.index[idx].1
+            }
+        }
+    }
+
+    fn read_block(&self, block_index: BlockIndex) -> BlockReader {
+        let (_, offset, size) = self.index[block_index];
+        BlockReader::new(&self.reader, offset, size)
+    }
+}
+
+struct BlockReader {}
+impl BlockReader {
+    fn new() {}
+    fn get(&self, key: String) -> Result<Entry> {}
 }
 
 pub struct DBIterator<'a> {
@@ -186,9 +285,112 @@ impl<'a> Iterator for DBIterator<'a> {
     }
 }
 
+#[derive(Debug)]
+enum BlockWriterError {
+    BlockSizeOverflow,
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for BlockWriterError {
+    fn from(value: std::io::Error) -> Self {
+        BlockWriterError::Io(value)
+    }
+}
+
+const BLOCKS_SIZE_KB: usize = 4 * 1024;
+const BLOCK_NUM_ENTRIES_BYTES: usize = 4;
+struct BlockWriter {
+    // number of bytes written so far in block_bytes
+    block_data: Vec<u8>,
+    block_footer: Vec<u8>,
+    last_key: Option<String>,
+}
+
+impl BlockWriter {
+    pub fn new() -> Self {
+        BlockWriter {
+            block_data: Vec::new(),
+            block_footer: Vec::new(),
+            last_key: None,
+        }
+    }
+
+    pub fn add_to_block(&mut self, key: &str, entry: &Entry) -> Result<(), BlockWriterError> {
+        let key_bytes = key.as_bytes();
+        let key_len = key_bytes.len();
+        let value_len = entry.len();
+
+        let entry_offset = self.block_data.len();
+
+        let entry_size = key_len + value_len + (3 * (size_of::<u32>())) + 1; // 3 u32s + 1 u8: entry_offset, key_len, value_len, present byte// num keys
+        if self.bytes_written() + entry_size > BLOCKS_SIZE_KB {
+            return Err(BlockWriterError::BlockSizeOverflow);
+        }
+        self.block_data.write(&(key_len as u32).to_le_bytes())?;
+        self.block_data.write(&(value_len as u32).to_le_bytes())?;
+        self.block_data.write(key_bytes)?;
+        match entry {
+            Entry::Present(value) => {
+                self.block_data.write(&1u8.to_le_bytes())?;
+                self.block_data.write(&value)?;
+            }
+            Entry::Deleted => {
+                self.block_data.write(&0u8.to_le_bytes())?;
+            }
+        }
+
+        self.block_footer
+            .write(&(entry_offset as u32).to_be_bytes())?;
+        self.last_key = Some(key.to_string());
+        Ok(())
+    }
+
+    fn bytes_written(&self) -> usize {
+        self.block_data.len() + self.block_footer.len() + BLOCK_NUM_ENTRIES_BYTES
+    }
+
+    // Encoding:
+    //   - entry #1
+    //     - key length (4 bytes)
+    //     - value length (4 bytes)
+    //     - key (variable length)
+    //     - indicator for Present (1) or Deleted (0).  (1 byte)
+    //     - value (variable length)
+    //   - entry #2
+    //     ..
+    //   - byte offset of entry #1 (4 bytes)
+    //   - byte offset of entry #2 (4 bytes)
+    //     ..
+    //   - number of entries (4 bytes)
+    pub fn write(self, writer: &mut dyn std::io::Write) -> Result<(usize, String), std::io::Error> {
+        writer.write_all(&self.block_data)?;
+        writer.write_all(&self.block_footer)?;
+        let num_entries = (&self.block_footer).len() / size_of::<u32>();
+        writer.write(&(num_entries as u32).to_le_bytes())?;
+        let bytes_written = self.bytes_written();
+        Ok((bytes_written, self.last_key.unwrap()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_writer_one_entry() {
+        let mut buffer = Vec::new();
+        let mut writer = BlockWriter::new();
+        writer
+            .add_to_block("/user/vardhan", &Entry::Present(b"vardhan".to_vec()))
+            .expect("write to block");
+        let (bytes_written, last_key) = writer.write(&mut buffer).expect("write to buffer");
+        assert_eq!(
+            buffer,
+            b"\x0d\x00\x00\x00\x07\x00\x00\x00/user/vardhan\x01vardhan\x00\x00\x00\x00\x01\x00\x00\x00"
+        );
+        assert_eq!(last_key, "/user/vardhan");
+        assert_eq!(bytes_written, buffer.len());
+    }
 
     #[test]
     fn basic() {
@@ -252,7 +454,8 @@ mod tests {
 
     #[test]
     fn seek_with_frozen_memtable() {
-        let mut db = DB::open(Path::new("/tmp/hello")).expect("failed to open");
+        let tmpdir = tempdir::TempDir::new("lsmdb").expect("tmpdir");
+        let mut db = DB::open(tmpdir.path()).expect("failed to open");
 
         db.put("/user/name/adam", "adam")
             .expect("cant put /user/adam");
