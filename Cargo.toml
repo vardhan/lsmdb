@@ -7,4 +7,5 @@ edition = "2021"
 tempdir = "0.3.7"
 
 [dependencies]
+tempdir = "0.3.7"
 thiserror = "1.0.40"
