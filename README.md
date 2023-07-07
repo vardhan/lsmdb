@@ -1,7 +1,10 @@
 # lsmdb
 A toy log structured merge tree database.
 
-The design is based off of [LevelDB](https://github.com/google/leveldb/blob/main/doc/impl.md) and [RocksDB](https://artem.krylysov.com/blog/2023/04/19/how-rocksdb-works/):
+The design is based off:
+- [LevelDB](https://github.com/google/leveldb/blob/main/doc/impl.md)
+- [RocksDB](https://artem.krylysov.com/blog/2023/04/19/how-rocksdb-works/)
+- [Original LSM-Tree paper](http://paperhub.s3.amazonaws.com/18e91eb4db2114a06ea614f0384f2784.pdf)
 
 # TODO:
 - get() looks up memtables *and* sstables
