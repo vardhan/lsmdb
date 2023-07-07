@@ -1,12 +1,14 @@
 use std::{
+    cell::RefCell,
     char::from_u32,
-    cmp::Ordering,
-    collections::{btree_map::Range, BTreeMap},
+    cmp::{Ordering, Reverse},
+    collections::{btree_map::Range, BTreeMap, BinaryHeap, VecDeque},
     error::Error,
+    fmt::Binary,
     io::{IoSliceMut, Read, Seek, SeekFrom, Write},
     iter::Peekable,
     mem::size_of,
-    ops::{Bound, Neg},
+    ops::{Bound, Deref, Neg},
     path::{Path, PathBuf},
     str::{FromStr, Utf8Error},
     string::FromUtf8Error,
@@ -50,8 +52,11 @@ use thiserror::Error;
 //
 // - size of sstable index in bytes (4 bytes)
 
-#[derive(Debug, PartialEq)]
-pub struct DBError;
+#[derive(Error, Debug, PartialEq)]
+pub enum DBError {
+    #[error("SSTableError: {0}")]
+    SSTableError(String),
+}
 
 pub type Key = String;
 pub type Value = Vec<u8>;
@@ -71,50 +76,107 @@ impl EntryValue {
         }
     }
 }
-
-const MEMTABLE_MAX_SIZE_BYTES: usize = 1024 * 1024 * 1; // 1 MB size threshold
+// Size threshold for a memtable (counts key & value)
+const MEMTABLE_MAX_SIZE_BYTES: usize = 1024 * 1024 * 1;
+// Max number of frozen memtables before they are force-flushed to sstable
+const MAX_NUM_FROZEN_MEMTABLES: usize = 4;
 
 type Memtable = BTreeMap<Key, EntryValue>;
 
 pub struct DB {
+    // SSTable files are stored under the root_path
     root_path: PathBuf,
-    memtable: Memtable,
-    memtable_frozen: Option<Memtable>,
 
-    // number of bytes that memtable has taken up so far
-    // accounts for key and value size.
-    memtable_size: usize,
+    // Active memtable, the latest source of data mutations
+    active_memtable: Memtable,
+
+    // Number of bytes that the active memtable has taken up so far.
+    // Accounts for key and value size.
+    active_memtable_size: usize,
+
+    // Frozen memtables are former active memtables which got too big
+    // (MEMTABLE_MAX_SIZE_BYTES) were snapshotted and saved. A frozen
+    // memtable is not mutable, and will be flushed to an SSTable file
+    // and removed from this list.
+    //
+    // The first element is the oldest memtable, the last is the newest.
+    frozen_memtables: VecDeque<Memtable>,
 }
 
 impl DB {
-    // `path` is a directory
-    pub fn open(path: &Path) -> Result<DB, DBError> {
+    // `root_path` is the directory where data files will live.
+    pub fn open(root_path: &Path) -> Result<DB, DBError> {
         Ok(DB {
-            root_path: path.into(),
-            memtable: BTreeMap::new(),
-            memtable_frozen: None,
-            memtable_size: 0,
+            root_path: root_path.into(),
+            active_memtable: BTreeMap::new(),
+            active_memtable_size: 0,
+            frozen_memtables: VecDeque::<Memtable>::new(),
         })
     }
 
+    // Looks up the given `key`.
+    //
+    // Returns `Some(value)` if the given `key` is found.
     pub fn get(&self, key: &str) -> Result<Option<Value>, DBError> {
         // first check the active memtable
-        let mut result: Option<EntryValue> = self._get_from_memtable(key, &self.memtable)?;
-
-        // if not in the active memtable, check the frozen memtable
-        if result.is_none() {
-            if let Some(snapshot) = self.memtable_frozen.as_ref() {
-                result = self._get_from_memtable(key, snapshot)?;
-            }
+        // if not in the active memtable, check the frozen memtables
+        // we have to check the most recently frozen memtable first (the last element)
+        for memtable in self
+            .frozen_memtables
+            .iter()
+            .chain([&self.active_memtable])
+            .rev()
+        {
+            match self.get_from_memtable(key, memtable)? {
+                Some(EntryValue::Present(value)) => return Ok(Some(value)),
+                Some(EntryValue::Deleted) => return Ok(None),
+                _ => continue,
+            };
         }
 
-        Ok(match result {
-            Some(EntryValue::Present(data)) => Some(data.clone()),
-            Some(EntryValue::Deleted) | None => None,
+        Ok(None)
+    }
+
+    pub fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> Result<(), DBError> {
+        self.put_entry(key.into(), EntryValue::Present(value.into()))
+    }
+
+    pub fn delete(&mut self, key: impl Into<Key>) -> Result<(), DBError> {
+        self.put_entry(key.into(), EntryValue::Deleted)
+    }
+
+    pub fn seek(&self, key_prefix: &str) -> Result<DBIterator, DBError> {
+        // make a min-heap of peekable iterators, where the heap key is:
+        // (peekable iterator, precedent)
+        Ok(DBIterator {
+            // most recent memtable is first
+            memtables: {
+                let memtable_iters = self
+                    .frozen_memtables
+                    .iter()
+                    .chain([&self.active_memtable])
+                    .map(|memtable| {
+                        memtable
+                            .range((Bound::Included(key_prefix.to_string()), Bound::Unbounded))
+                            .peekable()
+                    })
+                    .rev();
+                let mut heap = BinaryHeap::new();
+                let mut memtable_order = 0; // 0 means newest
+                for memtable_iter in memtable_iters {
+                    heap.push(Reverse(DBIteratorItem(
+                        RefCell::new(memtable_iter),
+                        memtable_order,
+                    )));
+                    memtable_order += 1;
+                }
+                heap
+            },
+            prefix: key_prefix.to_string(),
         })
     }
 
-    fn _get_from_memtable(
+    fn get_from_memtable(
         &self,
         key: &str,
         memtable: &BTreeMap<Key, EntryValue>,
@@ -122,55 +184,57 @@ impl DB {
         Ok(memtable.get(key).cloned())
     }
 
-    fn _put_entry(&mut self, key: Key, entry: EntryValue) -> Result<(), DBError> {
+    fn put_entry(&mut self, key: Key, entry: EntryValue) -> Result<(), DBError> {
         let key_len = key.as_bytes().len();
         let value_len = entry.len();
-        self.memtable_size += value_len;
-        match self.memtable.insert(key, entry) {
+        match self.active_memtable.insert(key, entry) {
             Some(old_value) => {
-                self.memtable_size -= old_value.len();
+                self.active_memtable_size += value_len;
+                self.active_memtable_size -= old_value.len();
             }
             None => {
-                self.memtable_size += key_len;
+                self.active_memtable_size += key_len;
+                self.active_memtable_size += value_len;
             }
         }
-        if self.memtable_size >= MEMTABLE_MAX_SIZE_BYTES {
-            self._swap_and_compact();
+        if self.active_memtable_size >= MEMTABLE_MAX_SIZE_BYTES {
+            self.freeze_active_memtable()
+                .map_err(|sstable_err| DBError::SSTableError(sstable_err.to_string()))?;
+        }
+        if self.frozen_memtables.len() >= MAX_NUM_FROZEN_MEMTABLES {
+            self.flush_frozen_memtables()
+                .map_err(|sstable_err| DBError::SSTableError(sstable_err.to_string()))?;
         }
         Ok(())
     }
 
-    pub fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> Result<(), DBError> {
-        self._put_entry(key.into(), EntryValue::Present(value.into()))
+    fn freeze_active_memtable(&mut self) -> Result<(), SSTableError> {
+        self.frozen_memtables
+            .push_back(std::mem::take(&mut self.active_memtable));
+        Ok(())
     }
 
-    pub fn delete(&mut self, key: impl Into<Key>) -> Result<(), DBError> {
-        self._put_entry(key.into(), EntryValue::Deleted)
-    }
+    fn flush_frozen_memtables(&mut self) -> Result<(), SSTableError> {
+        // TODO: write ALL frozen memtables to sstables
+        assert!(self.frozen_memtables.len() == 1);
 
-    pub fn seek(&self, prefix: &str) -> Result<DBIterator, DBError> {
-        Ok(DBIterator {
-            iter_memtable_mut: self
-                .memtable
-                .range((Bound::Included(prefix.to_string()), Bound::Unbounded))
-                .peekable(),
-            iter_memtable_immut: self.memtable_frozen.as_ref().map(|memtable| {
-                memtable
-                    .range((Bound::Included(prefix.to_string()), Bound::Unbounded))
-                    .peekable()
-            }),
-            prefix: prefix.to_string(),
-        })
-    }
-
-    fn _swap_and_compact(&mut self) -> Result<(), SSTableError> {
-        assert!(self.memtable_frozen.is_none());
-        self.memtable_frozen = Some(std::mem::take(&mut self.memtable));
-
-        // flush memtable to sstable
-        let mut file = std::fs::File::create(self.root_path.join("sstable"))
+        // flush the frozen memtable to sstable
+        let mut sstable_file = std::fs::File::create(self.root_path.join("sstable"))
             .expect("could not create sstable file");
-        self.write_memtable_to_sstable(self.memtable_frozen.as_ref().unwrap(), &mut file)
+
+        self.write_memtable_to_sstable(
+            self.frozen_memtables
+                .front()
+                .ok_or_else(|| SSTableError::Custom("No frozen memtables to flush"))?,
+            &mut sstable_file,
+        )?;
+        sstable_file.sync_all()?;
+        std::mem::drop(sstable_file); // close the new sstable file
+
+        // remove the frozen memtable; From now on, DB::get() will query the sstable instead.
+        self.frozen_memtables.clear();
+
+        Ok(())
     }
 
     // Flushes the given `memtable` to an sstable file using `writer`.
@@ -226,9 +290,45 @@ impl DB {
     }
 }
 
+type MemtablePeekableIter<'a> = Peekable<Range<'a, Key, EntryValue>>;
+type MemtableOrder = u32; // smaller is newer
+
+// TODO: Avoid using a RefCell<> by caching the saving the next key in DBIteratorItem.
+// e.g., struct DBIteratorItem(next_key, MemTableIter<>, MemtableOrder);
+// TODO: Instead of just iterating over Memtable, also iterate over SSTables.
+struct DBIteratorItem<'a>(RefCell<MemtablePeekableIter<'a>>, MemtableOrder);
+
+impl<'a> Ord for DBIteratorItem<'a> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (&self.0.borrow_mut().peek(), &other.0.borrow_mut().peek()) {
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some((self_key, _)), Some((ref other_key, _))) => {
+                (self_key, self.1).cmp(&(&&other_key, other.1))
+            }
+            (None, None) => Ordering::Equal,
+        }
+    }
+}
+impl<'a> PartialOrd for DBIteratorItem<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(Ord::cmp(self, other))
+    }
+}
+impl<'a> PartialEq for DBIteratorItem<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl<'a> Eq for DBIteratorItem<'a> {}
+
+// An iterator used to scan over many memtables.
 pub struct DBIterator<'a> {
-    iter_memtable_mut: Peekable<Range<'a, Key, EntryValue>>,
-    iter_memtable_immut: Option<Peekable<Range<'a, Key, EntryValue>>>,
+    // BinaryHeap is a max-heap, so items (memtable iterators) are placed with
+    // Reverse() to make it a min-heap.
+    memtables: BinaryHeap<Reverse<DBIteratorItem<'a>>>,
+
+    // the prefix to scan
     prefix: Key,
 }
 
@@ -236,63 +336,78 @@ impl<'a> Iterator for DBIterator<'a> {
     type Item = (Key, Value);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // We may need to skip deleted items, so iterate the inner iterator in a loop.
-        loop {
-            // Peek at both iterators and see which comes next.
-            let (key, value) = match (
-                self.iter_memtable_mut.peek(),
-                self.iter_memtable_immut
-                    .as_mut()
-                    .map(|i| i.peek())
-                    .flatten(),
-            ) {
-                // Both iterators have a value, check which takes precedence.
-                (Some((key_mut, _value_mut)), Some((key_immut, _value_immut))) => {
-                    match key_mut.cmp(key_immut) {
-                        Ordering::Equal => {
-                            // The left (mutable) key takes precedence over the right (immutable).
-                            // Skip the stale value in the immutable iterator.
-                            let _ = self.iter_memtable_immut.as_mut().unwrap().next();
-                            self.iter_memtable_mut.next().unwrap()
-                        }
-                        Ordering::Less => {
-                            // Consume the left (mutable) value first
-                            self.iter_memtable_mut.next().unwrap()
-                        }
-                        Ordering::Greater => {
-                            // Consume the right (immutable) value first
-                            self.iter_memtable_immut.as_mut().unwrap().next().unwrap()
-                        }
-                    }
-                }
-                // Only the left iterator (mutable) has a value, take it as-is.
-                (Some((_key, _value)), None) => self.iter_memtable_mut.next().unwrap(),
-                // Only the right iterator (immutable) has a value, take it as-is.
-                (None, Some((_key, _value))) => {
-                    self.iter_memtable_immut.as_mut().unwrap().next().unwrap()
-                }
-                // Both iterators are exhausted, terminate.
-                (None, None) => return None,
-            };
-            // The underlying iterator iterates over a range that is unbounded, so we need to
-            // check when the keys stop matching the desired prefix.
-            if !key.starts_with(&self.prefix) {
-                // Terminate iteration. This is enough to satisfy the iterator protocol; we don't
-                // need to mark any internal state that iteration is ended.
+        'pop_key_val: loop {
+            if self.memtables.peek().is_none() {
                 return None;
             }
-            match value {
-                EntryValue::Present(data) => return Some((key.clone(), data.clone())),
-                EntryValue::Deleted => {
-                    // The key was deleted, so skip it and fetch the next value.
+            // 1. Take out the smallest iterator (we have to put it back at the end)
+            let top_memtable = self.memtables.pop();
+            let top_kv = match &top_memtable {
+                None => return None, // There are no more memtables.
+                Some(Reverse(DBIteratorItem(kv_iter, _))) => kv_iter.borrow_mut().next(),
+            };
+
+            match top_kv {
+                Some((key, entry_value)) => {
+                    if !key.starts_with(self.prefix.as_str()) {
+                        return None;
+                    }
+                    // 2. Skip any duplicates of this key -- we already have the newest one.
+                    self.skip_entries_with_key(key);
+
+                    // 3. Put the memtable iterator back into the heap
+                    self.memtables.push(top_memtable.unwrap());
+
+                    match entry_value {
+                        EntryValue::Present(value) => {
+                            return Some((key.to_string(), value.clone()))
+                        }
+                        EntryValue::Deleted => continue 'pop_key_val, // deleted -- try the next key value.
+                    }
                 }
+                // If we hit an memtable iterator that's empty, it implies that all iterators are empty,
+                // so we can early-exit this iterator.
+                None => return None,
+            };
+        }
+    }
+}
+
+impl<'a> DBIterator<'a> {
+    fn peek_next_key(&mut self) -> Option<&Key> {
+        let next_memtable = self.memtables.peek();
+        if next_memtable.is_none() {
+            return None;
+        }
+        let DBIteratorItem(ref next_kv_iter_ref, _) = next_memtable.as_ref().unwrap().0;
+        let mut next_kv_iter = next_kv_iter_ref.borrow_mut();
+        let next_kv = next_kv_iter.peek();
+        match next_kv {
+            Some((key, _)) => Some(key),
+            _ => None,
+        }
+    }
+    // Must call peek_next_key() first -- panics if there is no next key.
+    fn skip_next_key(&mut self) {
+        let next_memtable = self.memtables.pop().unwrap();
+        let DBIteratorItem(next_kv_iter_ref, next_kv_order) = next_memtable.0;
+        next_kv_iter_ref.borrow_mut().next();
+        self.memtables
+            .push(Reverse(DBIteratorItem(next_kv_iter_ref, next_kv_order)));
+    }
+
+    fn skip_entries_with_key(&mut self, key: &String) {
+        loop {
+            match self.peek_next_key() {
+                Some(next_key) if key == next_key => self.skip_next_key(),
+                _ => return,
             }
         }
     }
 }
 
 #[derive(Error, Debug)]
-enum SSTableError {
+pub enum SSTableError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -301,6 +416,7 @@ enum SSTableError {
     FromUtf8Error(#[from] FromUtf8Error),
     #[error("block is too big. make a new block")]
     BlockSizeOverflow,
+    // TODO:  Replace `Custom` with specific error codes
     #[error("SSTableError: {0}")]
     Custom(&'static str),
 }
@@ -592,6 +708,7 @@ mod tests {
 
         db.put("1", "hello").expect("cant put 1");
         db.put("2", "world").expect("cant put 2");
+
         assert_eq!(db.get("1"), Ok(Some("hello".as_bytes().to_vec())));
         assert_eq!(db.get("2"), Ok(Some("world".as_bytes().to_vec())));
         assert_eq!(db.get("3"), Ok(None));
@@ -605,6 +722,7 @@ mod tests {
         db.put("2", "world").expect("cant put 2");
 
         assert_eq!(db.get("2"), Ok(Some(b"world".to_vec())));
+
         db.delete("2").expect("couldnt delete 2");
         assert_eq!(db.get("2").expect("cant put 2"), None);
     }
@@ -619,6 +737,7 @@ mod tests {
             .expect("cant put /user/vardhan");
         db.put("/abc", "abc").expect("cant put /abc");
         db.put("/xyz", "xyz").expect("cant put /xyz");
+
         assert_eq!(db.get("/user/name/vardhan"), Ok(Some(b"vardhan".to_vec())));
 
         assert_eq!(
@@ -647,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn seek_with_frozen_memtable() {
+    fn seek_with_active_and_frozen_memtable() {
         let tmpdir = tempdir::TempDir::new("lsmdb").expect("tmpdir");
         let mut db = DB::open(tmpdir.path()).expect("failed to open");
 
@@ -660,7 +779,10 @@ mod tests {
         db.put("/abc", "abc").expect("cant put /abc");
         db.put("/xyz", "xyz").expect("cant put /xyz");
 
-        db._swap_and_compact().expect("could not flush memtable");
+        db.freeze_active_memtable()
+            .expect("could not freeze active memtable");
+
+        // There should be two memtables now; active and 1 frozen.
 
         assert_eq!(
             db.seek("/user/")
@@ -673,12 +795,15 @@ mod tests {
             ]
         );
 
+        // put() and delete() below go in the active memtable, replacing the frozen entries.
         db.delete("/user/name/catherine")
             .expect("couldnt delete /user/catherine");
 
-        db.put("/user/name/adam", "vardhan")
+        db.put("/user/name/adam", "adam2")
             .expect("cant put /user/name/adam");
 
+        assert_eq!(db.get("/user/name/adam"), Ok(Some(b"adam2".to_vec())));
+        assert_eq!(db.get("/user/name/catherine"), Ok(None));
         assert_eq!(db.get("/user/name/vardhan"), Ok(Some(b"vardhan".to_vec())));
 
         assert_eq!(
@@ -686,8 +811,28 @@ mod tests {
                 .expect("couldnt seek /user")
                 .collect::<Vec<(Key, Value)>>(),
             vec![
-                ("/user/name/adam".to_string(), b"vardhan".to_vec()),
+                ("/user/name/adam".to_string(), b"adam2".to_vec()),
                 ("/user/name/vardhan".to_string(), b"vardhan".to_vec())
+            ]
+        );
+
+        db.freeze_active_memtable()
+            .expect("could not freeze active memtable");
+
+        // Now we have 3 memtables:  1 active and 2 frozen.
+        db.put("/user/name/adam", "adam3")
+            .expect("cant put /user/name/adam");
+        db.put("/user/name/catherine", "catherine3")
+            .expect("cant put /user/name/catherine");
+        db.delete("/user/name/vardhan")
+            .expect("cant put /user/name/vardhan");
+        assert_eq!(
+            db.seek("/user/")
+                .expect("couldnt seek /user")
+                .collect::<Vec<(Key, Value)>>(),
+            vec![
+                ("/user/name/adam".to_string(), b"adam3".to_vec()),
+                ("/user/name/catherine".to_string(), b"catherine3".to_vec())
             ]
         );
 
@@ -782,7 +927,7 @@ mod tests {
                 .expect("could not put");
         }
 
-        db._swap_and_compact()
+        db.freeze_active_memtable()
             .expect("could not flush memtable to sstable");
         let all_sstable_paths = tempdir
             .path()
