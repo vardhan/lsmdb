@@ -101,6 +101,24 @@ pub struct DB {
     //
     // The first element is the oldest memtable, the last is the newest.
     frozen_memtables: VecDeque<Memtable>,
+
+    config: DBConfig,
+}
+
+pub struct DBConfig {
+    // Size threshold for a memtable (counts key & value)
+    memtable_max_size_bytes: usize,
+    // Max number of frozen memtables before they are force-flushed to sstable
+    max_frozen_memtables: usize,
+}
+
+impl Default for DBConfig {
+    fn default() -> Self {
+        DBConfig {
+            memtable_max_size_bytes: 1024 * 1024 * 1, // 1 MB
+            max_frozen_memtables: 1,
+        }
+    }
 }
 
 impl DB {
@@ -111,6 +129,17 @@ impl DB {
             active_memtable: BTreeMap::new(),
             active_memtable_size: 0,
             frozen_memtables: VecDeque::<Memtable>::new(),
+            config: DBConfig::default(),
+        })
+    }
+
+    pub fn open_with_config(root_path: &Path, config: DBConfig) -> Result<DB, DBError> {
+        Ok(DB {
+            root_path: root_path.into(),
+            active_memtable: BTreeMap::new(),
+            active_memtable_size: 0,
+            frozen_memtables: VecDeque::<Memtable>::new(),
+            config,
         })
     }
 
@@ -197,11 +226,11 @@ impl DB {
                 self.active_memtable_size += value_len;
             }
         }
-        if self.active_memtable_size >= MEMTABLE_MAX_SIZE_BYTES {
+        if self.active_memtable_size >= self.config.memtable_max_size_bytes {
             self.freeze_active_memtable()
                 .map_err(|sstable_err| DBError::SSTableError(sstable_err.to_string()))?;
         }
-        if self.frozen_memtables.len() >= MAX_NUM_FROZEN_MEMTABLES {
+        if self.frozen_memtables.len() > self.config.max_frozen_memtables {
             self.flush_frozen_memtables()
                 .map_err(|sstable_err| DBError::SSTableError(sstable_err.to_string()))?;
         }
@@ -768,7 +797,15 @@ mod tests {
     #[test]
     fn seek_with_active_and_frozen_memtable() {
         let tmpdir = tempdir::TempDir::new("lsmdb").expect("tmpdir");
-        let mut db = DB::open(tmpdir.path()).expect("failed to open");
+        let mut db = DB::open_with_config(
+            tmpdir.path(),
+            DBConfig {
+                // don't trigger writing to sstables
+                max_frozen_memtables: 100,
+                ..DBConfig::default()
+            },
+        )
+        .expect("couldnt make db");
 
         db.put("/user/name/adam", "adam")
             .expect("cant put /user/adam");
@@ -911,7 +948,15 @@ mod tests {
     #[test]
     fn write_to_sstable() {
         let tempdir = TempDir::new("lsmdb_test").expect("couldnt make a temp dir");
-        let mut db = DB::open(tempdir.path()).expect("couldnt make db");
+        let mut db = DB::open_with_config(
+            tempdir.path(),
+            DBConfig {
+                // don't write to sstable;  we'll trigger that manually in this test
+                max_frozen_memtables: 4,
+                ..DBConfig::default()
+            },
+        )
+        .expect("couldnt make db");
 
         // generates the value for the key. the value is vector of u8s: (0 .. key%255)
         let fn_generate_val_for_key = |key| {
@@ -920,21 +965,25 @@ mod tests {
                 .collect::<Vec<u8>>()
         };
 
-        // generate 1 MB of key/value pairs.
-        let num_keys_to_generate = 7000u32; // from experimenting, this generates 1MB.
+        // generate <1 MB of key/value pairs.
+        let num_keys_to_generate = 7000u32; // from experimenting, this generates < 1MB
         for i in 0..num_keys_to_generate {
             db.put(format!("/user/b_{i}", i = i), fn_generate_val_for_key(i))
                 .expect("could not put");
         }
 
         db.freeze_active_memtable()
-            .expect("could not flush memtable to sstable");
-        let all_sstable_paths = tempdir
+            .expect("could not freeze active memtable");
+        db.flush_frozen_memtables()
+            .expect("could not flush frozen memtable");
+        let all_sstable_paths: Vec<PathBuf> = tempdir
             .path()
             .read_dir()
             .expect("couldnt read temp dir")
             .map(|dirent| dirent.unwrap().path())
-            .into_iter();
+            .into_iter()
+            .collect();
+        assert!(all_sstable_paths.len() == 1);
         for path in all_sstable_paths {
             let mut file = std::fs::File::open(path.clone()).expect("couldnt open file");
             let mut sstable = SSTableReader::from_reader(&mut file).expect("couldnt make sstable");
