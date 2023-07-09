@@ -1,6 +1,8 @@
 use std::{
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     mem::size_of,
+    path::PathBuf,
     str::Utf8Error,
     string::FromUtf8Error,
 };
@@ -52,21 +54,21 @@ use crate::db::{EntryValue, Key, Memtable};
 //   ..
 // - ..
 // - size of sstable index in bytes (u32; LE)
-
-pub struct SSTableReader<'r, R: Read + Seek + 'r> {
-    reader: &'r mut R,
+pub(crate) struct SSTableReader {
+    file: File,
 
     // (last_key, block byte offset, block size), sorted by last_key.
     index: Vec<(String, u32, u32)>,
 }
 
-impl<'r, R: Read + Seek + 'r> SSTableReader<'r, R> {
-    pub fn from_reader(reader: &'r mut R) -> Result<Self, SSTableError> {
-        let index = Self::parse_index(reader)?;
-        Ok(SSTableReader { reader, index })
+impl SSTableReader {
+    pub fn from_path(path: &PathBuf) -> Result<Self, SSTableError> {
+        let mut file = std::fs::File::open(path.clone())?;
+        let index = Self::parse_index(&mut file)?;
+        Ok(SSTableReader { file, index })
     }
 
-    fn parse_index(reader: &mut R) -> Result<Vec<(String, u32, u32)>, SSTableError> {
+    fn parse_index(reader: &mut File) -> Result<Vec<(String, u32, u32)>, SSTableError> {
         // Parse the sstable index size (last 4 bytes)
         reader.seek(SeekFrom::End(-1 * (size_of::<u32>() as i64)))?;
 
@@ -104,7 +106,7 @@ impl<'r, R: Read + Seek + 'r> SSTableReader<'r, R> {
             None => None,
             Some((offset, size)) => {
                 // TODO: cache the BlockReader
-                let mut block_reader = BlockReader::new(self.reader, offset, size)?;
+                let mut block_reader = BlockReader::new(&mut self.file, offset, size)?;
                 block_reader.get(key)?
             }
         })
@@ -184,7 +186,7 @@ pub(crate) fn write_memtable_to_sstable(
 }
 
 #[derive(Error, Debug)]
-pub enum SSTableError {
+pub(crate) enum SSTableError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -200,7 +202,7 @@ pub enum SSTableError {
 
 const BLOCK_SIZE_MAX_KB: usize = 4 * 1024;
 const BLOCK_NUM_ENTRIES_SIZEOF: usize = size_of::<u32>();
-pub struct BlockWriter {
+pub(crate) struct BlockWriter {
     // Encoding of a single block:
     //   - entry #1
     //     - key length (4 bytes)
@@ -233,9 +235,15 @@ impl BlockWriter {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len();
         let value_len = entry.len();
-
         let entry_offset = self.block_data.len();
-        let entry_size = key_len + value_len + (3 * (size_of::<u32>())) + 1;
+        let entry_size =
+              key_len
+            + value_len 
+            + 1 // presence bit (present or deleted)
+            + size_of::<u32>() // key length
+            + size_of::<u32>() // value length
+            + size_of::<u32>() // byte offset for block footer
+            ;
         if self.block_size() + entry_size > BLOCK_SIZE_MAX_KB {
             return Err(SSTableError::BlockSizeOverflow);
         }
@@ -278,7 +286,7 @@ impl BlockWriter {
     }
 }
 
-pub struct BlockReader<'r, T: Read + Seek + 'r> {
+pub(crate) struct BlockReader<'r, T: Read + Seek + 'r> {
     reader: &'r mut T,
     block_offset: u32,
     num_entries: u32,
@@ -292,7 +300,6 @@ trait ReaderExt {
     // Allocates a new vector of size `length` and reads into it.
     fn read_u8s(&mut self, length: usize) -> Result<Vec<u8>, std::io::Error>;
 }
-
 impl<T: Read> ReaderExt for T {
     fn read_u32_le(&mut self) -> Result<u32, std::io::Error> {
         let mut encoded_num: [u8; 4] = Default::default();
@@ -361,12 +368,14 @@ impl<'r, T: Read + Seek + 'r> BlockReader<'r, T> {
         let val_len = self.reader.read_u32_le()? as usize;
         let key = self.reader.read_u8s(key_len)?;
         let is_present = self.reader.read_u8()?;
-        let val = self.reader.read_u8s(val_len)?;
         Ok((
             String::from_utf8(key)?,
             match is_present {
                 0 => EntryValue::Deleted,
-                1 => EntryValue::Present(val),
+                1 => {
+                    let val = self.reader.read_u8s(val_len)?;
+                    EntryValue::Present(val)
+                }
                 _ => {
                     return Err(SSTableError::Custom("invalid isPresent"));
                 }
@@ -377,9 +386,12 @@ impl<'r, T: Read + Seek + 'r> BlockReader<'r, T> {
 
 #[cfg(test)]
 mod test {
+    use crate::{
+        db::{DBConfig, DB},
+        sstable::*,
+    };
     use std::io::Cursor;
-
-    use crate::sstable::*;
+    use tempdir::TempDir;
 
     #[test]
     fn block_writer_one_entry() {
@@ -410,9 +422,12 @@ mod test {
         writer
             .add_to_block("/key3", &EntryValue::Deleted)
             .expect("cant delete /key3");
+        writer
+            .add_to_block("/key4", &EntryValue::Present(vec![7, 8, 9]))
+            .expect("cant put /key4");
 
         let (size, last_key) = writer.flush(&mut mem).expect("could not flush");
-        assert_eq!(last_key, "/key3");
+        assert_eq!(last_key, "/key4");
 
         let mut reader = BlockReader::new(&mut mem, 0, size as u32).expect("couldnt make reader");
         assert_eq!(
@@ -427,7 +442,11 @@ mod test {
             reader.get("/key3").expect("cant find deleted /key3"),
             Some(EntryValue::Deleted)
         );
-        assert_eq!(reader.get("/key4").expect("found unknown key /key4"), None);
+        assert_eq!(
+            reader.get("/key4").expect("cant find deleted /key4"),
+            Some(EntryValue::Present(vec![7, 8, 9]))
+        );
+        assert_eq!(reader.get("/key5").expect("found unknown key /key5"), None);
     }
 
     #[test]
@@ -452,5 +471,72 @@ mod test {
             ),
             Err(SSTableError::BlockSizeOverflow)
         ));
+    }
+
+    #[test]
+    fn write_to_sstable() {
+        let tempdir = TempDir::new("lsmdb_test").expect("couldnt make a temp dir");
+        let mut db = DB::open_with_config(
+            tempdir.path(),
+            DBConfig {
+                // don't auto-write to sstable; this test triggers that manually
+                max_frozen_memtables: 4,
+                ..DBConfig::default()
+            },
+        )
+        .expect("couldnt make db");
+
+        // generates the value for the key. the value is vector of u8s: (0 .. key%255)
+        let fn_generate_val_for_key = |key| {
+            (0..(key % (u8::MAX as u32)))
+                .map(|num| num as u8)
+                .collect::<Vec<u8>>()
+        };
+
+        // generate <1 MB of key/value pairs.
+        let num_keys_to_generate = 7000u32; // from experimenting, this generates < 1MB
+        for i in 0..num_keys_to_generate {
+            db.put(format!("/user/b_{i}", i = i), fn_generate_val_for_key(i))
+                .expect("could not put");
+        }
+
+        db.freeze_active_memtable()
+            .expect("could not freeze active memtable");
+        db.flush_frozen_memtables()
+            .expect("could not flush frozen memtable");
+        let all_sstable_paths: Vec<PathBuf> = tempdir
+            .path()
+            .read_dir()
+            .expect("couldnt read temp dir")
+            .map(|dirent| dirent.unwrap().path())
+            .into_iter()
+            .collect();
+        assert!(all_sstable_paths.len() == 1);
+        for path in all_sstable_paths {
+            // let mut file = std::fs::File::open(path.clone()).expect("couldnt open file");
+            let mut sstable = SSTableReader::from_path(&path).expect("couldnt make sstable");
+            for i in 0..num_keys_to_generate {
+                // this key should exist
+                assert_eq!(
+                    sstable
+                        .get(format!("/user/b_{i}", i = i).as_str())
+                        .expect("couldnt get"),
+                    Some(EntryValue::Present(fn_generate_val_for_key(i)))
+                );
+
+                // append a `_` to the end of the key, so that the same block is (most likely) going to be queried.
+                assert_eq!(
+                    sstable
+                        .get(format!("/user/b_{i}_", i = i + 1).as_str())
+                        .expect("couldnt get unknown"),
+                    None,
+                );
+            }
+
+            // Try to get a missing key which would be past the last key in the sstable
+            assert_eq!(sstable.get("/user/c").expect("couldnt get unknown"), None);
+            // Try to get a missing key which would be before the first key in the sstable
+            assert_eq!(sstable.get("/user/a").expect("couldnt get unknown"), None);
+        }
     }
 }

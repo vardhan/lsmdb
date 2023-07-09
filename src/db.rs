@@ -3,18 +3,28 @@ use std::{
     cell::RefCell,
     cmp::{Ordering, Reverse},
     collections::{btree_map::Range, BTreeMap, BinaryHeap, VecDeque},
-    iter::Peekable,
+    fs::{DirBuilder, DirEntry, ReadDir},
+    iter::{Enumerate, Peekable},
     ops::Bound,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
 
-use crate::sstable::{self, write_memtable_to_sstable};
+use crate::sstable::{self, write_memtable_to_sstable, SSTableReader};
 
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug, Eq, PartialEq)]
 pub enum DBError {
     #[error("SSTableError: {0}")]
-    SSTableError(String),
+    SSTable(String),
+
+    #[error("Root path is not valid directory: {0}")]
+    InvalidRootPath(String),
+
+    #[error("SSTable file path error: {0}")]
+    SSTableFilePath(String),
+
+    #[error("IO Error: {0}")]
+    Io(String),
 }
 
 pub type Key = String;
@@ -31,7 +41,7 @@ impl EntryValue {
     pub fn len(&self) -> usize {
         match self {
             EntryValue::Present(value) => value.len(),
-            EntryValue::Deleted => 1,
+            EntryValue::Deleted => 0,
         }
     }
 }
@@ -42,6 +52,16 @@ pub struct DB {
     // SSTable files are stored under the root_path
     root_path: PathBuf,
 
+    // Opened SSTables readers.
+    // For now:
+    // - All known sstables are opened.
+    // - All SSTables are level-0 (they have overlapping keys)
+    //
+    // First element is the oldest sstable, the last is the newest.
+    //
+    // SSTables are stored
+    sstables: Vec<SSTableReader>,
+
     // Active memtable, the latest source of data mutations
     active_memtable: Memtable,
 
@@ -50,7 +70,7 @@ pub struct DB {
     active_memtable_size: usize,
 
     // Frozen memtables are former active memtables which got too big
-    // (MEMTABLE_MAX_SIZE_BYTES) were snapshotted and saved. A frozen
+    // (DBConfig::memtable_max_size_bytes) were snapshotted and saved. A frozen
     // memtable is not mutable, and will be flushed to an SSTable file
     // and removed from this list.
     //
@@ -62,9 +82,9 @@ pub struct DB {
 
 pub struct DBConfig {
     // Size threshold for a memtable (counts key & value)
-    memtable_max_size_bytes: usize,
+    pub memtable_max_size_bytes: usize,
     // Max number of frozen memtables before they are force-flushed to sstable
-    max_frozen_memtables: usize,
+    pub max_frozen_memtables: usize,
 }
 
 impl Default for DBConfig {
@@ -79,18 +99,14 @@ impl Default for DBConfig {
 impl DB {
     // `root_path` is the directory where data files will live.
     pub fn open(root_path: &Path) -> Result<DB, DBError> {
-        Ok(DB {
-            root_path: root_path.into(),
-            active_memtable: BTreeMap::new(),
-            active_memtable_size: 0,
-            frozen_memtables: VecDeque::<Memtable>::new(),
-            config: DBConfig::default(),
-        })
+        DB::open_with_config(root_path, DBConfig::default())
     }
 
+    // `root_path` is the directory where data files will live.
     pub fn open_with_config(root_path: &Path, config: DBConfig) -> Result<DB, DBError> {
         Ok(DB {
             root_path: root_path.into(),
+            sstables: Self::open_all_sstables(root_path)?,
             active_memtable: BTreeMap::new(),
             active_memtable_size: 0,
             frozen_memtables: VecDeque::<Memtable>::new(),
@@ -98,10 +114,71 @@ impl DB {
         })
     }
 
+    // Opens all SSTable files stored under given the `root_path` directory.
+    //
+    // SSTable filenames are formatted as <age>.sstable, where <age> is a number used
+    // to signify the precedence order of the sstables.
+    // - The oldest SSTable is `0.sst`, the 2nd oldest is `1.sst`, and so on.
+    // - The newest SSTable has the highest number.
+    // - New SSTables are stored using the filename `<highest age so far + 1>.sst`.
+    fn open_all_sstables(root_path: &Path) -> Result<Vec<SSTableReader>, DBError> {
+        if !root_path
+            .try_exists()
+            .map_err(|io_err| DBError::InvalidRootPath(io_err.to_string()))?
+        {
+            // create dir and exit
+            DirBuilder::new()
+                .recursive(true)
+                .create(root_path)
+                .map_err(|io_err| DBError::Io(io_err.to_string()))?;
+            return Ok(Vec::new());
+        } else if !root_path.is_dir() {
+            return Err(DBError::InvalidRootPath(
+                root_path.to_str().unwrap().to_string(),
+            ));
+        }
+
+        // Grab all the .sst files, which are formatted as `<age>.sst`
+        // sort them by their age (ascending), and open/store them in this sorted order.
+        // 1. Grab all the paths
+        let mut path_bufs = Vec::new();
+        for dirent in root_path
+            .read_dir()
+            .map_err(|io_err: std::io::Error| DBError::Io(io_err.to_string()))?
+        {
+            let path_buf = dirent
+                .map_err(|io_err: std::io::Error| DBError::Io(io_err.to_string()))?
+                .path();
+            let sst_num = i32::from_str_radix(
+                path_buf
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .split(".")
+                    .next()
+                    .unwrap(),
+                10,
+            )
+            .map_err(|err| DBError::SSTableFilePath(err.to_string()))?;
+            path_bufs.push((sst_num, path_buf.clone()));
+        }
+        path_bufs.sort_by_key(|(num, _)| *num);
+
+        let mut readers = Vec::new();
+        for (_, path_buf) in path_bufs {
+            readers.push(
+                SSTableReader::from_path(&path_buf)
+                    .map_err(|err| DBError::SSTable(err.to_string()))?,
+            );
+        }
+        Ok(readers)
+    }
+
     // Looks up the given `key`.
     //
     // Returns `Some(value)` if the given `key` is found.
-    pub fn get(&self, key: &str) -> Result<Option<Value>, DBError> {
+    pub fn get(&mut self, key: &str) -> Result<Option<Value>, DBError> {
         // first check the active memtable
         // if not in the active memtable, check the frozen memtables
         // we have to check the most recently frozen memtable first (the last element)
@@ -116,6 +193,16 @@ impl DB {
                 Some(EntryValue::Deleted) => return Ok(None),
                 _ => continue,
             };
+        }
+
+        // Not in the memtables?  Lets try the sstables
+        // Newest one first
+        for sstable in self.sstables.iter_mut().rev() {
+            match sstable.get(key) {
+                Ok(Some(EntryValue::Present(value))) => return Ok(Some(value)),
+                Ok(Some(EntryValue::Deleted)) => return Ok(None),
+                _ => continue,
+            }
         }
 
         Ok(None)
@@ -183,39 +270,37 @@ impl DB {
         }
         if self.active_memtable_size >= self.config.memtable_max_size_bytes {
             self.freeze_active_memtable()
-                .map_err(|sstable_err| DBError::SSTableError(sstable_err.to_string()))?;
+                .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
         }
         if self.frozen_memtables.len() > self.config.max_frozen_memtables {
             self.flush_frozen_memtables()
-                .map_err(|sstable_err| DBError::SSTableError(sstable_err.to_string()))?;
+                .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
         }
         Ok(())
     }
 
-    fn freeze_active_memtable(&mut self) -> Result<(), SSTableError> {
+    pub(crate) fn freeze_active_memtable(&mut self) -> Result<(), SSTableError> {
         self.frozen_memtables
             .push_back(std::mem::take(&mut self.active_memtable));
         Ok(())
     }
 
-    fn flush_frozen_memtables(&mut self) -> Result<(), SSTableError> {
-        // TODO: write ALL frozen memtables to sstables
-        assert!(self.frozen_memtables.len() == 1);
+    pub(crate) fn flush_frozen_memtables(&mut self) -> Result<(), SSTableError> {
+        for frozen_memtable in self.frozen_memtables.iter() {
+            let i = self.sstables.len();
+            let sstable_path = self.root_path.join(format!("{}.sst", i));
 
-        // flush the frozen memtable to sstable
-        let mut sstable_file = std::fs::File::create(self.root_path.join("sstable"))
-            .expect("could not create sstable file");
+            // flush the frozen memtable to sstable
+            let mut sstable_file =
+                std::fs::File::create(sstable_path.clone()).expect("could not create sstable file");
+            write_memtable_to_sstable(&frozen_memtable, &mut sstable_file)?;
+            sstable_file.sync_all()?;
+            std::mem::drop(sstable_file);
 
-        write_memtable_to_sstable(
-            self.frozen_memtables
-                .front()
-                .ok_or_else(|| SSTableError::Custom("No frozen memtables to flush"))?,
-            &mut sstable_file,
-        )?;
-        sstable_file.sync_all()?;
-        std::mem::drop(sstable_file); // close the new sstable file
+            self.sstables.push(SSTableReader::from_path(&sstable_path)?);
+        }
 
-        // remove the frozen memtable; From now on, DB::get() will query the sstable instead.
+        // remove all frozen memtables; From now on, DB::get() will query the sstable instead.
         self.frozen_memtables.clear();
 
         Ok(())
@@ -340,8 +425,17 @@ impl<'a> DBIterator<'a> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
     use super::*;
+    use anyhow;
     use tempdir::TempDir;
+
+    fn make_db_for_test(config: DBConfig) -> DB {
+        let tmpdir = tempdir::TempDir::new("lsmdb").expect("tmpdir");
+        let mut db = DB::open_with_config(tmpdir.path(), config).expect("couldnt make db");
+        db
+    }
 
     #[test]
     fn basic_put_get() {
@@ -501,70 +595,111 @@ mod test {
     }
 
     #[test]
-    fn write_to_sstable() {
-        let tempdir = TempDir::new("lsmdb_test").expect("couldnt make a temp dir");
+    fn flush_memtable_to_sstable() {
+        let tmpdir = tempdir::TempDir::new("lsmdb").expect("tmpdir");
         let mut db = DB::open_with_config(
-            tempdir.path(),
+            tmpdir.path(),
             DBConfig {
-                // don't auto-write to sstable; this test triggers that manually
-                max_frozen_memtables: 4,
+                // No automatic flushing; all manual for now
+                max_frozen_memtables: 100,
                 ..DBConfig::default()
             },
         )
         .expect("couldnt make db");
 
-        // generates the value for the key. the value is vector of u8s: (0 .. key%255)
-        let fn_generate_val_for_key = |key| {
-            (0..(key % (u8::MAX as u32)))
-                .map(|num| num as u8)
-                .collect::<Vec<u8>>()
-        };
-
-        // generate <1 MB of key/value pairs.
-        let num_keys_to_generate = 7000u32; // from experimenting, this generates < 1MB
-        for i in 0..num_keys_to_generate {
-            db.put(format!("/user/b_{i}", i = i), fn_generate_val_for_key(i))
-                .expect("could not put");
+        let keys = vec!["a", "b", "c", "d", "e", "f"];
+        for key in &keys {
+            db.put(format!("/key/{}", key), format!("val {}", key))
+                .expect("couldnt put");
+            db.freeze_active_memtable()
+                .expect("couldnt freeze active memtables");
         }
+        assert_eq!(db.frozen_memtables.len(), keys.len());
 
-        db.freeze_active_memtable()
-            .expect("could not freeze active memtable");
         db.flush_frozen_memtables()
-            .expect("could not flush frozen memtable");
-        let all_sstable_paths: Vec<PathBuf> = tempdir
-            .path()
-            .read_dir()
-            .expect("couldnt read temp dir")
-            .map(|dirent| dirent.unwrap().path())
-            .into_iter()
-            .collect();
-        assert!(all_sstable_paths.len() == 1);
-        for path in all_sstable_paths {
-            let mut file = std::fs::File::open(path.clone()).expect("couldnt open file");
-            let mut sstable =
-                sstable::SSTableReader::from_reader(&mut file).expect("couldnt make sstable");
-            for i in 0..num_keys_to_generate {
-                // this key should exist
-                assert_eq!(
-                    sstable
-                        .get(format!("/user/b_{i}", i = i).as_str())
-                        .expect("couldnt get"),
-                    Some(EntryValue::Present(fn_generate_val_for_key(i)))
-                );
+            .expect("couldnt flush frozen memtables");
 
-                // append a `_` to the end of the key, so that the same block is (most likely) going to be queried.
+        assert_eq!(db.sstables.len(), keys.len());
+
+        // sstables should now be persisted -- test that they are accessible when db is re-opened
+        std::mem::drop(db);
+        let mut db: DB = DB::open_with_config(
+            tmpdir.path(),
+            DBConfig {
+                // No automatic flushing; all manual for now
+                max_frozen_memtables: 100,
+                ..DBConfig::default()
+            },
+        )
+        .expect("couldnt reopen db");
+        assert_eq!(db.sstables.len(), keys.len());
+
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                db.sstables[i]
+                    .get(format!("/key/{}", key).as_str())
+                    .expect(format!("couldnt get /key/{}", key).as_str()),
+                Some(EntryValue::Present(format!("val {}", key).into_bytes()))
+            );
+            for non_present_key in keys.iter() {
+                if non_present_key == key {
+                    continue;
+                }
                 assert_eq!(
-                    sstable
-                        .get(format!("/user/b_{i}_", i = i + 1).as_str())
-                        .expect("couldnt get unknown"),
-                    None,
+                    db.sstables[i]
+                        .get(format!("/key/{}", non_present_key).as_str())
+                        .expect(format!("couldnt get /key/{}", non_present_key).as_str()),
+                    None
                 );
             }
-
-            // Try to get a missing key which would be past the last key in the sstable
-            assert_eq!(sstable.get("/user/c").expect("couldnt get unknown"), None);
-            // Try to get a missing key which would be before the first key in the sstable
-            assert_eq!(sstable.get("/user/a").expect("couldnt get unknown"), None);
         }
+    }
+
+    #[test]
+    fn basic_across_memtables_and_sstables() -> anyhow::Result<()> {
+        // zig-zag keys across active, frozen, and an sstable.
+        let tmpdir = tempdir::TempDir::new("lsmdb")?;
+        let mut db = DB::open_with_config(
+            tmpdir.path(),
+            DBConfig {
+                // No automatic flushing; all manual for now
+                max_frozen_memtables: 100,
+                ..DBConfig::default()
+            },
+        )?;
+
+        db.put("/key/1", "sstable0".as_bytes())?; // should be replaced by sstable1 and then frozen memtable
+        db.put("/key/3", "sstable0".as_bytes())?;
+        db.put("/key/4", "sstable0".as_bytes())?; // should be replaced by sstable1
+        db.freeze_active_memtable()?;
+        db.flush_frozen_memtables()?;
+
+        db.delete("/key/1")?; // should replace sstable0, and be replaced by frozen memtable
+        db.put("/key/2", "sstable1".as_bytes())?;
+        db.put("/key/4", "sstable1".as_bytes())?; // should replace sstable0
+        db.freeze_active_memtable()?;
+        db.flush_frozen_memtables()?;
+
+        db.put("/key/1", "frozen".as_bytes())?;
+        db.put("/key/5", "frozen".as_bytes())?;
+        db.freeze_active_memtable()?;
+
+        db.put("/key/0", "active".as_bytes())?;
+        db.put("/key/6", "active".as_bytes())?;
+
+        assert_eq!(db.active_memtable.len(), 2);
+        assert_eq!(db.frozen_memtables.len(), 1);
+        assert_eq!(db.frozen_memtables[0].len(), 2);
+        assert_eq!(db.sstables.len(), 2);
+
+        assert_eq!(db.get("/key/3")?, Some("sstable0".into()));
+        assert_eq!(db.get("/key/2")?, Some("sstable1".into()));
+        assert_eq!(db.get("/key/4")?, Some("sstable1".into()));
+        assert_eq!(db.get("/key/1")?, Some("frozen".into()));
+        assert_eq!(db.get("/key/5")?, Some("frozen".into()));
+        assert_eq!(db.get("/key/0")?, Some("active".into()));
+        assert_eq!(db.get("/key/6")?, Some("active".into()));
+
+        Ok(())
     }
 }
