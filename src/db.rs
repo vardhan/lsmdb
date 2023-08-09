@@ -1,10 +1,8 @@
 use sstable::SSTableError;
 use std::{
-    cell::RefCell,
     cmp::{Ordering, Reverse},
-    collections::{btree_map::Range, BTreeMap, BinaryHeap, VecDeque},
-    fs::{DirBuilder, DirEntry, ReadDir},
-    iter::{Enumerate, Peekable},
+    collections::{BTreeMap, BinaryHeap, VecDeque},
+    fs::DirBuilder,
     ops::Bound,
     path::{Path, PathBuf},
 };
@@ -96,6 +94,31 @@ impl Default for DBConfig {
     }
 }
 
+// This is a container for a peekable iterator for iterating over memtable or sstable.
+struct DBIteratorPeekable<'a> {
+    next: Option<(Key, EntryValue)>, // this is the item next() and peek() will return
+    iter: Box<dyn Iterator<Item = (Key, EntryValue)> + 'a>, //
+}
+
+impl<'a> DBIteratorPeekable<'a> {
+    pub(crate) fn new(
+        mut iter: Box<dyn Iterator<Item = (Key, EntryValue)> + 'a>,
+    ) -> DBIteratorPeekable {
+        let next = iter.next();
+        DBIteratorPeekable { next, iter }
+    }
+
+    pub(crate) fn next(&mut self) -> Option<(Key, EntryValue)> {
+        let next = std::mem::take(&mut self.next);
+        self.next = self.iter.next();
+        next
+    }
+
+    pub(crate) fn peek(&self) -> Option<&(Key, EntryValue)> {
+        self.next.as_ref()
+    }
+}
+
 impl DB {
     // `root_path` is the directory where data files will live.
     pub fn open(root_path: &Path) -> Result<DB, DBError> {
@@ -140,7 +163,6 @@ impl DB {
 
         // Grab all the .sst files, which are formatted as `<age>.sst`
         // sort them by their age (ascending), and open/store them in this sorted order.
-        // 1. Grab all the paths
         let mut path_bufs = Vec::new();
         for dirent in root_path
             .read_dir()
@@ -216,34 +238,47 @@ impl DB {
         self.put_entry(key.into(), EntryValue::Deleted)
     }
 
-    pub fn seek(&self, key_prefix: &str) -> Result<DBIterator, DBError> {
+    pub fn scan(&mut self, key_prefix: &str) -> Result<DBIterator, DBError> {
         // make a min-heap of peekable iterators, where the heap key is:
         // (peekable iterator, precedent)
         Ok(DBIterator {
             // most recent memtable is first
-            memtables: {
-                let memtable_iters = self
-                    .frozen_memtables
-                    .iter()
-                    .chain([&self.active_memtable])
-                    .map(|memtable| {
+            iterators: {
+                // (next element, rest of iterator)
+                let mut db_iters_peekable = Vec::<DBIteratorPeekable>::new();
+
+                // add the sstables
+                db_iters_peekable.append(
+                    &mut self
+                        .sstables
+                        .iter_mut()
+                        // for sstable_reader in self.sstables {}
+                        .map(|sstable_reader| -> DBIteratorPeekable {
+                            DBIteratorPeekable::new(Box::new(
+                                sstable_reader.scan(key_prefix).unwrap(),
+                            ))
+                        })
+                        .collect::<Vec<_>>(),
+                );
+
+                // add the memtables
+                for memtable in self.frozen_memtables.iter().chain([&self.active_memtable]) {
+                    db_iters_peekable.push(DBIteratorPeekable::new(Box::new(
                         memtable
                             .range((Bound::Included(key_prefix.to_string()), Bound::Unbounded))
-                            .peekable()
-                    })
-                    .rev();
-                let mut heap = BinaryHeap::new();
-                let mut memtable_order = 0; // 0 means newest
-                for memtable_iter in memtable_iters {
-                    heap.push(Reverse(DBIteratorItem(
-                        RefCell::new(memtable_iter),
-                        memtable_order,
+                            .map(|(&ref key, &ref entry_val)| (key.clone(), entry_val.clone())),
                     )));
-                    memtable_order += 1;
+                }
+
+                let mut heap = BinaryHeap::new();
+                let mut iter_precedence = 0; // 0 means newest
+                for db_iter in db_iters_peekable.into_iter().rev() {
+                    heap.push(Reverse(DBIteratorItem(db_iter, iter_precedence)));
+                    iter_precedence += 1;
                 }
                 heap
             },
-            prefix: key_prefix.to_string(),
+            key_prefix: key_prefix.to_string(),
         })
     }
 
@@ -307,17 +342,13 @@ impl DB {
     }
 }
 
-type MemtablePeekableIter<'a> = Peekable<Range<'a, Key, EntryValue>>;
-type MemtableOrder = u32; // smaller is newer
-
-// TODO: Avoid using a RefCell<> by caching the saving the next key in DBIteratorItem.
-// e.g., struct DBIteratorItem(next_key, MemTableIter<>, MemtableOrder);
-// TODO: Instead of just iterating over Memtable, also iterate over SSTables.
-struct DBIteratorItem<'a>(RefCell<MemtablePeekableIter<'a>>, MemtableOrder);
+// DBIteratorItem is an element in priority queue used for DB::scan().
+struct DBIteratorItem<'a>(DBIteratorPeekable<'a>, DBIteratorPrecedence);
+type DBIteratorPrecedence = u32; // smaller is newer.  active memtable has 0, frozen memtables have 1..N, and sstables have N+1..
 
 impl<'a> Ord for DBIteratorItem<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        match (&self.0.borrow_mut().peek(), &other.0.borrow_mut().peek()) {
+        match (&self.0.peek(), &other.0.peek()) {
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (Some((self_key, _)), Some((ref other_key, _))) => {
@@ -341,12 +372,12 @@ impl<'a> Eq for DBIteratorItem<'a> {}
 
 // An iterator used to scan over many memtables.
 pub struct DBIterator<'a> {
-    // BinaryHeap is a max-heap, so items (memtable iterators) are placed with
+    // BinaryHeap is a max-heap, so items (memtable & sstable iterators) are placed with
     // Reverse() to make it a min-heap.
-    memtables: BinaryHeap<Reverse<DBIteratorItem<'a>>>,
+    iterators: BinaryHeap<Reverse<DBIteratorItem<'a>>>,
 
     // the prefix to scan
-    prefix: Key,
+    key_prefix: Key,
 }
 
 impl<'a> Iterator for DBIterator<'a> {
@@ -354,32 +385,36 @@ impl<'a> Iterator for DBIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         'pop_key_val: loop {
-            if self.memtables.peek().is_none() {
+            if self.iterators.peek().is_none() {
                 return None;
             }
             // 1. Take out the smallest iterator (we have to put it back at the end)
-            let top_memtable = self.memtables.pop();
-            let top_kv = match &top_memtable {
+            let mut top_memtable = self.iterators.pop();
+            let top_kv = match top_memtable {
                 None => return None, // There are no more memtables.
-                Some(Reverse(DBIteratorItem(kv_iter, _))) => kv_iter.borrow_mut().next(),
+                Some(Reverse(DBIteratorItem(ref mut db_iter_peekable, _))) => {
+                    db_iter_peekable.next()
+                }
             };
 
             match top_kv {
                 Some((key, entry_value)) => {
-                    if !key.starts_with(self.prefix.as_str()) {
+                    if !key.starts_with(self.key_prefix.as_str()) {
                         return None;
                     }
                     // 2. Skip any duplicates of this key -- we already have the newest one.
-                    self.skip_entries_with_key(key);
+                    self.skip_entries_with_key(&key);
 
-                    // 3. Put the memtable iterator back into the heap
-                    self.memtables.push(top_memtable.unwrap());
+                    // 3. Put the memtable iterator back into the heap and return the entry
+                    self.iterators.push(top_memtable.unwrap());
 
                     match entry_value {
                         EntryValue::Present(value) => {
-                            return Some((key.to_string(), value.clone()))
+                            return Some((key, value));
                         }
-                        EntryValue::Deleted => continue 'pop_key_val, // deleted -- try the next key value.
+                        EntryValue::Deleted => {
+                            continue 'pop_key_val;
+                        } // deleted -- try the next key value.
                     }
                 }
                 // If we hit an memtable iterator that's empty, it implies that all iterators are empty,
@@ -392,25 +427,26 @@ impl<'a> Iterator for DBIterator<'a> {
 
 impl<'a> DBIterator<'a> {
     fn peek_next_key(&mut self) -> Option<&Key> {
-        let next_memtable = self.memtables.peek();
+        let next_memtable = self.iterators.peek();
         if next_memtable.is_none() {
             return None;
         }
-        let DBIteratorItem(ref next_kv_iter_ref, _) = next_memtable.as_ref().unwrap().0;
-        let mut next_kv_iter = next_kv_iter_ref.borrow_mut();
-        let next_kv = next_kv_iter.peek();
+        let DBIteratorItem(ref db_peekable_iter_ref, _) = next_memtable.as_ref().unwrap().0;
+        // let mut db_peekable_iter = db_peekable_iter_ref.borrow_mut();
+        let next_kv = db_peekable_iter_ref.peek();
         match next_kv {
             Some((key, _)) => Some(key),
             _ => None,
         }
     }
+
     // Must call peek_next_key() first -- panics if there is no next key.
     fn skip_next_key(&mut self) {
-        let next_memtable = self.memtables.pop().unwrap();
-        let DBIteratorItem(next_kv_iter_ref, next_kv_order) = next_memtable.0;
-        next_kv_iter_ref.borrow_mut().next();
-        self.memtables
-            .push(Reverse(DBIteratorItem(next_kv_iter_ref, next_kv_order)));
+        let next_memtable = self.iterators.pop().unwrap();
+        let DBIteratorItem(mut db_peekable_iter_ref, next_kv_order) = next_memtable.0;
+        db_peekable_iter_ref.next();
+        self.iterators
+            .push(Reverse(DBIteratorItem(db_peekable_iter_ref, next_kv_order)));
     }
 
     fn skip_entries_with_key(&mut self, key: &String) {
@@ -463,7 +499,7 @@ mod test {
     }
 
     #[test]
-    fn basic_seek() {
+    fn basic_scan() {
         let mut db = DB::open(Path::new("/tmp/hello")).expect("failed to open");
 
         db.put("/user/name/adam", "adam")
@@ -476,8 +512,8 @@ mod test {
         assert_eq!(db.get("/user/name/vardhan"), Ok(Some(b"vardhan".to_vec())));
 
         assert_eq!(
-            db.seek("/user/")
-                .expect("couldnt seek /user")
+            db.scan("/user/")
+                .expect("couldnt scan /user")
                 .collect::<Vec<(Key, Value)>>(),
             vec![
                 ("/user/name/adam".to_string(), b"adam".to_vec()),
@@ -486,22 +522,22 @@ mod test {
         );
 
         assert_eq!(
-            db.seek("/user/vardhan_")
+            db.scan("/user/vardhan_")
                 .expect("couldn't seen /user/vardhan_")
                 .collect::<Vec<(Key, Value)>>(),
             vec![]
         );
 
         assert_eq!(
-            db.seek("/items/")
-                .expect("couldnt seek /items")
+            db.scan("/items/")
+                .expect("couldnt scan /items")
                 .collect::<Vec<(Key, Value)>>(),
             vec![]
         );
     }
 
     #[test]
-    fn seek_with_active_and_frozen_memtable() {
+    fn scan_with_active_and_frozen_memtable() {
         let tmpdir = tempdir::TempDir::new("lsmdb").expect("tmpdir");
         let mut db = DB::open_with_config(
             tmpdir.path(),
@@ -528,8 +564,8 @@ mod test {
         // There should be two memtables now; active and 1 frozen.
 
         assert_eq!(
-            db.seek("/user/")
-                .expect("couldnt seek /user")
+            db.scan("/user/")
+                .expect("couldnt scan /user")
                 .collect::<Vec<(Key, Value)>>(),
             vec![
                 ("/user/name/adam".to_string(), b"adam".to_vec()),
@@ -550,8 +586,8 @@ mod test {
         assert_eq!(db.get("/user/name/vardhan"), Ok(Some(b"vardhan".to_vec())));
 
         assert_eq!(
-            db.seek("/user/")
-                .expect("couldnt seek /user")
+            db.scan("/user/")
+                .expect("couldnt scan /user")
                 .collect::<Vec<(Key, Value)>>(),
             vec![
                 ("/user/name/adam".to_string(), b"adam2".to_vec()),
@@ -570,8 +606,8 @@ mod test {
         db.delete("/user/name/vardhan")
             .expect("cant put /user/name/vardhan");
         assert_eq!(
-            db.seek("/user/")
-                .expect("couldnt seek /user")
+            db.scan("/user/")
+                .expect("couldnt scan /user")
                 .collect::<Vec<(Key, Value)>>(),
             vec![
                 ("/user/name/adam".to_string(), b"adam3".to_vec()),
@@ -580,15 +616,15 @@ mod test {
         );
 
         assert_eq!(
-            db.seek("/user/vardhan_")
+            db.scan("/user/vardhan_")
                 .expect("couldn't see /user/vardhan_")
                 .collect::<Vec<(Key, Value)>>(),
             vec![]
         );
 
         assert_eq!(
-            db.seek("/items/")
-                .expect("couldnt seek /items")
+            db.scan("/items/")
+                .expect("couldnt scan /items")
                 .collect::<Vec<(Key, Value)>>(),
             vec![]
         );
@@ -699,6 +735,23 @@ mod test {
         assert_eq!(db.get("/key/5")?, Some("frozen".into()));
         assert_eq!(db.get("/key/0")?, Some("active".into()));
         assert_eq!(db.get("/key/6")?, Some("active".into()));
+
+        // Ensure that scan("/key") doesn't pick up on surrounding keys:
+        db.put("/a", "garbage".as_bytes())?;
+        db.put("/z", "garbage".as_bytes())?;
+
+        assert_eq!(
+            db.scan("/key/")?.collect::<Vec<_>>(),
+            vec![
+                ("/key/0".to_string(), b"active".to_vec()),
+                ("/key/1".to_string(), b"frozen".to_vec()),
+                ("/key/2".to_string(), b"sstable1".to_vec()),
+                ("/key/3".to_string(), b"sstable0".to_vec()),
+                ("/key/4".to_string(), b"sstable1".to_vec()),
+                ("/key/5".to_string(), b"frozen".to_vec()),
+                ("/key/6".to_string(), b"active".to_vec()),
+            ]
+        );
 
         Ok(())
     }
