@@ -1,8 +1,6 @@
 use std::{
-    collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
-    iter::Map,
     path::PathBuf,
 };
 
@@ -10,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
 
-use crate::db::Key;
+
 
 /// Manifest file
 ///
@@ -204,13 +202,12 @@ impl Manifest {
 mod test {
     use std::{
         fs,
-        io::{Read, Seek, SeekFrom, Write},
     };
 
     use assert_unordered::assert_eq_unordered;
     use tempdir::TempDir;
 
-    use super::{KeyRange, Manifest, ManifestOp};
+    use super::{KeyRange, Manifest};
 
     #[test]
     fn empty() -> anyhow::Result<()> {

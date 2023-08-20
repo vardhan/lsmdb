@@ -4,7 +4,7 @@ use std::{
     mem::size_of,
     path::PathBuf,
     str::Utf8Error,
-    string::FromUtf8Error, iter, ops::Deref
+    string::FromUtf8Error
 };
 
 use thiserror::Error;

@@ -2,7 +2,6 @@ use sstable::SSTableError;
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BinaryHeap, VecDeque},
-    fs::DirBuilder,
     ops::Bound,
     path::{Path, PathBuf},
 };
@@ -145,7 +144,7 @@ impl DB {
     ///
     /// `root_dir` is the directory where data files will live.
     pub fn open_with_config(root_dir: &Path, config: DBConfig) -> Result<DB, DBError> {
-        let mut manifest = Manifest::open(&root_dir.to_path_buf())
+        let manifest = Manifest::open(&root_dir.to_path_buf())
             .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e.to_string())))?;
         let sstables = Self::open_all_sstables(&manifest)?;
         Ok(DB {
@@ -478,15 +477,15 @@ impl<'a> DBIterator<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    
 
     use super::*;
     use anyhow;
-    use tempdir::TempDir;
+    
 
     fn make_db_for_test(config: DBConfig) -> DB {
         let tmpdir = tempdir::TempDir::new("lsmdb").expect("tmpdir");
-        let mut db = DB::open_with_config(tmpdir.path(), config).expect("couldnt make db");
+        let db = DB::open_with_config(tmpdir.path(), config).expect("couldnt make db");
         db
     }
 
