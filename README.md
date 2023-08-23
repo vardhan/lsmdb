@@ -1,4 +1,4 @@
-[![lsmdb](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml/badge.svg)](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml)
+[![lsmdb](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml/badge.svg)](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml) [![codecov](https://codecov.io/github/vardhan/lsmdb/graph/badge.svg?token=Dtb9glS5dO)](https://codecov.io/github/vardhan/lsmdb)
 
 # lsmdb
 A toy log structured merge tree database.
