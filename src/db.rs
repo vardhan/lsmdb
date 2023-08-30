@@ -1,3 +1,10 @@
+use crate::db_iter::{DBIterator, DBIteratorItem, DBIteratorItemPeekable};
+
+// mod compaction;
+mod manifest;
+mod reader_ext;
+mod sstable;
+
 use sstable::SSTableError;
 use std::{
     cmp::Reverse,
@@ -7,10 +14,9 @@ use std::{
 };
 use thiserror::Error;
 
-use crate::{
-    db_iter::{DBIterator, DBIteratorItem, DBIteratorItemPeekable},
+use self::{
     manifest::{KeyRange, Manifest},
-    sstable::{self, write_memtable_to_sstable, SSTableReader},
+    sstable::{write_to_sstable, SSTableReader},
 };
 
 #[derive(Error, Debug)]
@@ -294,7 +300,7 @@ impl DB {
             // flush the frozen memtable to sstable
             let mut sstable_file =
                 std::fs::File::create(sstable_path.clone()).expect("could not create sstable file");
-            write_memtable_to_sstable(frozen_memtable, &mut sstable_file, &self.config)?;
+            write_to_sstable(frozen_memtable.iter(), &mut sstable_file, &self.config)?;
             sstable_file.sync_all()?;
             std::mem::drop(sstable_file);
 
@@ -339,7 +345,7 @@ mod test {
 
     use super::*;
     use anyhow;
-    use pretty_assertions::{assert_eq};
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn basic_put_get() {

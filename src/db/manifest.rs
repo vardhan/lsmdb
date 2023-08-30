@@ -7,7 +7,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use thiserror::Error;
-
 /// Manifest file
 ///
 /// The manifest file is a log file which describes changes to the database file structure.

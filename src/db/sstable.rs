@@ -9,8 +9,9 @@ use std::{
 
 use thiserror::Error;
 
-use crate::db::{EntryValue, Key, Memtable, Value, DBConfig};
-use crate::reader_ext::ReaderExt;
+use crate::db::{EntryValue, Key, Value, DBConfig};
+
+use super::reader_ext::ReaderExt;
 
 // SSTable file format
 // ===================
@@ -223,8 +224,8 @@ impl<'a> Iterator for SSTableIterator<'a> {
     }
 }
 
-pub(crate) fn write_memtable_to_sstable(
-    memtable: &Memtable,
+pub(crate) fn write_to_sstable<'k>(
+    kv_iter: impl Iterator<Item=(&'k Key, &'k EntryValue)>,
     writer: &mut impl Write,
     db_config: &DBConfig,
 ) -> Result<(), SSTableError> {
@@ -234,15 +235,15 @@ pub(crate) fn write_memtable_to_sstable(
     let mut block_sizes: Vec<(usize, String)> = Vec::new();
 
     // write out all the keys
-    for (key, entry) in memtable {
-        match block_writer.add_to_block(key, entry) {
+    for (key, entry) in kv_iter {
+        match block_writer.add_to_block(&key, &entry) {
             Ok(()) => {}
             Err(SSTableError::BlockSizeOverflow) => {
                 // flush the current block to the `writer`, make a new block and add entry to it.
                 block_sizes.push(block_writer.flush(writer)?);
                 block_writer = BlockWriter::new(db_config);
                 block_writer
-                    .add_to_block(key, entry)
+                    .add_to_block(&key, &entry)
                     .expect("single key/value won't fit in block");
             }
             Err(err) => return Err(err),
@@ -546,8 +547,7 @@ impl<'k, 'r, R: Read + Seek + 'r> Iterator for BlockIterator<'k, 'r, R> {
 #[cfg(test)]
 mod test {
     use crate::{
-        db::{DBConfig, DB},
-        sstable::*,
+        db::{DBConfig, DB, sstable::{SSTableError, SSTableReader, BlockReader, BlockWriter}, EntryValue},
     };
     use std::io::Cursor;
     use tempdir::TempDir;

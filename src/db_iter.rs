@@ -3,16 +3,14 @@ use std::{
     collections::BinaryHeap,
 };
 
-use crate::{
-    db::{EntryValue, Key, Value},
-};
+use crate::db::{EntryValue, Key, Value};
 
 // DBIteratorItem is an element in priority queue used for DB::scan().
 pub(crate) struct DBIteratorItem<'a>(
     pub(crate) DBIteratorItemPeekable<'a>,
     pub(crate) DBIteratorPrecedence,
 );
-type DBIteratorPrecedence = u32; // smaller is newer.  active memtable has 0, frozen memtables have 1..N, and sstables have N+1..
+pub(crate) type DBIteratorPrecedence = u32; // smaller is newer.  active memtable has 0, frozen memtables have 1..N, and sstables have N+1..
 
 // This is a container for a peekable iterator for iterating over memtable or sstable.
 pub(crate) struct DBIteratorItemPeekable<'a> {
