@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json;
+
 use thiserror::Error;
 
 /// Manifest file
@@ -154,7 +154,7 @@ impl Manifest {
     ) -> Result<(), ManifestError> {
         match op {
             ManifestOp::AddSSTable { key_range, file } => {
-                if levels.len() == 0 {
+                if levels.is_empty() {
                     levels.push(vec![]);
                 }
                 levels[0].push((key_range, file));

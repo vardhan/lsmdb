@@ -75,12 +75,12 @@ impl SSTableReader {
 
     fn parse_index(reader: &mut File) -> Result<Vec<(String, u32, u32)>, SSTableError> {
         // Parse the sstable index size (last 4 bytes)
-        reader.seek(SeekFrom::End(-1 * (size_of::<u32>() as i64)))?;
+        reader.seek(SeekFrom::End(-(size_of::<u32>() as i64)))?;
         let index_size = reader.read_u32_le()?;
 
         // Go to the beginning of the index
         reader.seek(SeekFrom::End(
-            -1 * ((index_size + size_of::<u32>() as u32) as i64),
+            -((index_size + size_of::<u32>() as u32) as i64),
         ))?;
 
         // Parse the index;  a list of metadata about where each block is and its last key.
@@ -120,7 +120,7 @@ impl SSTableReader {
 
     // given a key, returns which block # (into self.index) might contain the key value pair
     fn get_candidate_block(&self, key: &str) -> Option<usize> {
-        if let Some(&ref last_entry) = self.block_index.last() {
+        if let Some(last_entry) = self.block_index.last() {
             if key > last_entry.0.as_str() {
                 return None;
             }
@@ -138,7 +138,7 @@ impl SSTableReader {
 
     /// Iterates the SSTable for keys beginning with `key_prefix`.
     /// Iterator yields keys in ascending sorted order.
-    pub(crate) fn scan<'a>(&'a mut self, key_prefix: &str) -> Result<SSTableIterator, SSTableError> {
+    pub(crate) fn scan(&mut self, key_prefix: &str) -> Result<SSTableIterator, SSTableError> {
         let (block_idx, mut block_reader) = match self.get_candidate_block(key_prefix) {
             Some(idx) => {
                 let (_, block_offset, block_size) = self.block_index[idx];
@@ -185,14 +185,10 @@ impl<'a> Iterator for SSTableIterator<'a> {
         // until we see [`SSTableError::EndOfBlock`], and then go to next block, and so on.
         //
         // Stop when there are no more blocks, or if we see SSTableError::KeyPrefixNotFound.
-        if self.sst_reader.is_none() {
-            return None
-        }
+        self.sst_reader.as_ref()?;
         let sst_reader = self.sst_reader.as_mut().unwrap();
         'read_block_entry: loop {
-            if self.cur_block.is_none() {
-                return None;
-            }
+            self.cur_block.as_ref()?;
             let (_cur_block_idx, ref mut cur_block_reader) = self.cur_block.as_mut().unwrap();
             match cur_block_reader.read_next_entry() {
                 Ok((key, EntryValue::Present(value))) if key.starts_with(&self.key_prefix) => return Some((key, EntryValue::Present(value))),
@@ -232,7 +228,7 @@ pub(crate) fn write_memtable_to_sstable(
     writer: &mut impl Write,
     db_config: &DBConfig,
 ) -> Result<(), SSTableError> {
-    let mut block_writer = BlockWriter::new(&db_config);
+    let mut block_writer = BlockWriter::new(db_config);
     // `block_sizes` is a list of block size entries.
     // each entry is:  # of bytes in the block, last key in the block.
     let mut block_sizes: Vec<(usize, String)> = Vec::new();
@@ -361,7 +357,7 @@ impl<'c> BlockWriter<'c> {
             EntryValue::Present(value_bytes) => {
                 self.block_data.write_all(&1u8.to_le_bytes())?;
                 self.block_data.write_all(&(value_len as u32).to_le_bytes())?;
-                self.block_data.write_all(&value_bytes)?;
+                self.block_data.write_all(value_bytes)?;
             }
             EntryValue::Deleted => {
                 self.block_data.write_all(&0u8.to_le_bytes())?;
@@ -386,7 +382,7 @@ impl<'c> BlockWriter<'c> {
     pub fn flush(self, writer: &mut dyn Write) -> Result<(usize, String), std::io::Error> {
         writer.write_all(&self.block_data)?;
         writer.write_all(&self.block_footer)?;
-        let num_entries = (&self.block_footer).len() / size_of::<u32>();
+        let num_entries = self.block_footer.len() / size_of::<u32>();
         writer.write(&(num_entries as u32).to_le_bytes())?;
         let block_size = self.block_size();
         Ok((block_size, self.last_key.unwrap()))
@@ -431,13 +427,13 @@ impl<R: Read + Seek> BlockReader<R> {
         }
 
         reader.seek(SeekFrom::Start(block_offset as u64))?;
-        return Ok(Self {
+        Ok(Self {
             reader,
             block_offset,
             num_entries,
             entry_offsets,
             entry_cursor: 0
-        });
+        })
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<EntryValue>, SSTableError> {
@@ -726,8 +722,8 @@ mod test {
         for (_key_range, path) in all_levels[0] {
             // let mut file = std::fs::File::open(path.clone()).expect("couldnt open file");
             let mut sstable =
-                SSTableReader::from_path(&tempdir.path().join(path).into())
-                    .expect(&format!("couldnt open sstable {}", path));
+                SSTableReader::from_path(&tempdir.path().join(path))
+                    .unwrap_or_else(|_| panic!("couldnt open sstable {}", path));
             for i in 0..num_keys_to_generate {
                 // this key should exist
                 assert_eq!(

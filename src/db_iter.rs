@@ -5,7 +5,6 @@ use std::{
 
 use crate::{
     db::{EntryValue, Key, Value},
-    manifest::KeyRange,
 };
 
 // DBIteratorItem is an element in priority queue used for DB::scan().
@@ -46,7 +45,7 @@ impl<'a> Ord for DBIteratorItem<'a> {
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (Some((self_key, _)), Some((ref other_key, _))) => {
-                (self_key, self.1).cmp(&(&&other_key, other.1))
+                (self_key, self.1).cmp(&(other_key, other.1))
             }
             (None, None) => Ordering::Equal,
         }
@@ -81,9 +80,7 @@ impl<'a> Iterator for DBIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         'pop_key_val: loop {
-            if self.iterators.peek().is_none() {
-                return None;
-            }
+            self.iterators.peek()?;
             // 1. Take out the smallest iterator (we have to put it back at the end)
             let mut top_memtable = self.iterators.pop();
             let top_kv = match top_memtable {
@@ -124,9 +121,7 @@ impl<'a> Iterator for DBIterator<'a> {
 impl<'a> DBIterator<'a> {
     fn peek_next_key(&mut self) -> Option<&Key> {
         let next_memtable = self.iterators.peek();
-        if next_memtable.is_none() {
-            return None;
-        }
+        next_memtable?;
         let DBIteratorItem(ref db_peekable_iter_ref, _) = next_memtable.as_ref().unwrap().0;
         // let mut db_peekable_iter = db_peekable_iter_ref.borrow_mut();
         let next_kv = db_peekable_iter_ref.peek();

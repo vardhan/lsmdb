@@ -100,7 +100,7 @@ pub struct DBConfig {
 impl Default for DBConfig {
     fn default() -> Self {
         DBConfig {
-            memtable_max_size_bytes: 1024 * 1024 * 1, // 1 MB
+            memtable_max_size_bytes: 1024 * 1024, // 1 MB
             max_frozen_memtables: 1,
             block_max_size_bytes: 1024 * 4,
         }
@@ -120,7 +120,7 @@ impl DB {
     /// `root_dir` is the directory where data files will live.
     pub fn open_with_config(root_dir: &Path, config: DBConfig) -> Result<DB, DBError> {
         let manifest = Manifest::open(&root_dir.to_path_buf())
-            .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e.to_string())))?;
+            .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e)))?;
         let sstables_l0 = Self::open_all_sstables(&manifest)?;
         Ok(DB {
             root_dir: root_dir.into(),
@@ -147,7 +147,7 @@ impl DB {
                 let sstable_path = manifest.root_dir().join(sstable_path);
                 readers.push_front(SSTableReader::from_path(&sstable_path).map_err(|err| {
                     DBError::SSTableOpen {
-                        sstable_path: sstable_path,
+                        sstable_path,
                         err: err.to_string(),
                     }
                 })?);
@@ -217,7 +217,7 @@ impl DB {
                     db_iters_peekable.push(DBIteratorItemPeekable::new(Box::new(
                         memtable
                             .range((Bound::Included(key_prefix.to_string()), Bound::Unbounded))
-                            .map(|(&ref key, &ref entry_val)| (key.clone(), entry_val.clone())),
+                            .map(|(key, entry_val)| (key.clone(), entry_val.clone())),
                     )));
                 }
 
@@ -294,7 +294,7 @@ impl DB {
             // flush the frozen memtable to sstable
             let mut sstable_file =
                 std::fs::File::create(sstable_path.clone()).expect("could not create sstable file");
-            write_memtable_to_sstable(&frozen_memtable, &mut sstable_file, &self.config)?;
+            write_memtable_to_sstable(frozen_memtable, &mut sstable_file, &self.config)?;
             sstable_file.sync_all()?;
             std::mem::drop(sstable_file);
 
@@ -330,7 +330,7 @@ impl DB {
 
     // for testing.
     pub(crate) fn get_sstables_mut(&mut self) -> &mut VecDeque<SSTableReader> {
-        return &mut self.sstables_l0;
+        &mut self.sstables_l0
     }
 }
 
@@ -339,7 +339,7 @@ mod test {
 
     use super::*;
     use anyhow;
-    use pretty_assertions::{assert_eq, assert_ne};
+    use pretty_assertions::{assert_eq};
 
     #[test]
     fn basic_put_get() {
@@ -551,7 +551,7 @@ mod test {
             assert_eq!(
                 db.sstables_l0[i]
                     .get(format!("/key/{}", key).as_str())
-                    .expect(format!("couldnt get /key/{}", key).as_str()),
+                    .unwrap_or_else(|_| panic!("couldnt get /key/{}", key)),
                 Some(EntryValue::Present(format!("val {}", key).into_bytes()))
             );
             for non_present_key in keys.iter().rev() {
@@ -561,7 +561,7 @@ mod test {
                 assert_eq!(
                     db.sstables_l0[i]
                         .get(format!("/key/{}", non_present_key).as_str())
-                        .expect(format!("couldnt get /key/{}", non_present_key).as_str()),
+                        .unwrap_or_else(|_| panic!("couldnt get /key/{}", non_present_key)),
                     None
                 );
             }
