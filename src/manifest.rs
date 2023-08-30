@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use thiserror::Error;
 
-
-
 /// Manifest file
 ///
 /// The manifest file is a log file which describes changes to the database file structure.
@@ -200,9 +198,7 @@ impl Manifest {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        fs,
-    };
+    use std::fs;
 
     use assert_unordered::assert_eq_unordered;
     use tempdir::TempDir;
