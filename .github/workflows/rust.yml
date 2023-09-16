@@ -28,7 +28,3 @@ jobs:
       with:
         version: '0.15.0'
         args: --all-features --lib --coveralls ${{ secrets.COVERALLS_KEY }}
-    - name: Upload to codecov.io
-      uses: codecov/codecov-action@v3
-      with:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
