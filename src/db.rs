@@ -1,22 +1,22 @@
 use crate::db_iter::{DBIterator, DBIteratorItem, DBIteratorItemPeekable};
 
-// mod compaction;
+mod compaction;
 mod manifest;
 mod reader_ext;
-mod sstable;
+pub(crate) mod sstable;
 
 use sstable::SSTableError;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, VecDeque},
-    ops::Bound,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
 
 use self::{
+    compaction::Compactor,
     manifest::{KeyRange, Manifest},
-    sstable::{write_to_sstable, SSTableReader},
+    sstable::{SSTableReader, SSTableWriter},
 };
 
 #[derive(Error, Debug)]
@@ -99,8 +99,14 @@ pub struct DBConfig {
     pub memtable_max_size_bytes: usize,
     /// Max number of frozen memtables before they are force-flushed to sstable
     pub max_frozen_memtables: usize,
-    // Size threshold for a block (counts all bytes in a block)
+    /// Size threshold for a block (counts all bytes in a block)
     pub block_max_size_bytes: usize,
+    /// The size (total bytes) level N can hold is [sstable_level_base_max_size_bytes]*10^(N)
+    /// Once level N gets to this size, level N is compacted into level N+1.
+    pub sstable_level_base_max_size_bytes: u64,
+    /// The max # of sstable files for level N >= 1 is [compaction_level_base_max_shards]*2^(N-1)
+    /// Note that level 0's max # of sstables is defined by Self::max_frozen_memtables
+    pub compaction_level_base_max_shards: u64,
 }
 
 impl Default for DBConfig {
@@ -109,6 +115,10 @@ impl Default for DBConfig {
             memtable_max_size_bytes: 1024 * 1024, // 1 MB
             max_frozen_memtables: 1,
             block_max_size_bytes: 1024 * 4,
+            // L0 = 10MB, L1 = 100mb, L2 = 1GB, L3 = 10GB ..
+            sstable_level_base_max_size_bytes: 1024 * 1024 * 10,
+            // L1 = 4 shards, L2 = 8, L3 = 16, ..)
+            compaction_level_base_max_shards: 4,
         }
     }
 }
@@ -151,7 +161,7 @@ impl DB {
         for level in manifest.levels() {
             for (_key_range, sstable_path) in level {
                 let sstable_path = manifest.root_dir().join(sstable_path);
-                readers.push_front(SSTableReader::from_path(&sstable_path).map_err(|err| {
+                readers.push_front(SSTableReader::new(&sstable_path).map_err(|err| {
                     DBError::SSTableOpen {
                         sstable_path,
                         err: err.to_string(),
@@ -220,11 +230,8 @@ impl DB {
                     .into_iter()
                     .chain(self.frozen_memtables.iter())
                 {
-                    db_iters_peekable.push(DBIteratorItemPeekable::new(Box::new(
-                        memtable
-                            .range((Bound::Included(key_prefix.to_string()), Bound::Unbounded))
-                            .map(|(key, entry_val)| (key.clone(), entry_val.clone())),
-                    )));
+                    db_iters_peekable
+                        .push(DBIteratorItemPeekable::from_memtable(memtable, key_prefix));
                 }
 
                 // add the sstables
@@ -233,10 +240,9 @@ impl DB {
                         .sstables_l0
                         .iter_mut()
                         // for sstable_reader in self.sstables {}
-                        .map(|sstable_reader| -> DBIteratorItemPeekable {
-                            DBIteratorItemPeekable::new(Box::new(
-                                sstable_reader.scan(key_prefix).unwrap(),
-                            ))
+                        .map(|sstable_reader| {
+                            DBIteratorItemPeekable::from_sstable(sstable_reader, key_prefix)
+                                .unwrap()
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -281,8 +287,28 @@ impl DB {
         if self.frozen_memtables.len() > self.config.max_frozen_memtables {
             self.flush_frozen_memtables_to_sstable()
                 .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
+
+            let l0_size = self.compute_level_size(0).map_err(|ss_err| {
+                DBError::SSTable(format!(
+                    "Could not compute size of level 0 sstables: {}",
+                    ss_err
+                ))
+            })?;
+            if l0_size > self.config.sstable_level_base_max_size_bytes {
+                Compactor {
+                    root_dir: &self.root_dir,
+                    db_config: &self.config,
+                }
+                .compact(&mut self.sstables_l0, 0)
+                .unwrap(); // panic if compaction fails; FIXME: fail more gracefully?
+            }
         }
         Ok(())
+    }
+
+    fn compute_level_size(&self, level: u32) -> Result<u64, SSTableError> {
+        assert!(level == 0, "only level 0 compaction is supported");
+        self.sstables_l0.iter().map(|reader| reader.size()).sum()
     }
 
     pub(crate) fn freeze_active_memtable(&mut self) -> Result<(), SSTableError> {
@@ -294,18 +320,22 @@ impl DB {
     pub(crate) fn flush_frozen_memtables_to_sstable(&mut self) -> Result<(), SSTableError> {
         // flush the oldest frozen memtable first, and the newest one last.
         for frozen_memtable in self.frozen_memtables.iter().rev() {
-            let sstable_filename: String = format!("{}.sst", self.sstables_l0.len());
+            let sstable_filename: String = format!("l0-{}.sst", self.sstables_l0.len());
             let sstable_path = self.root_dir.join(&sstable_filename);
 
             // flush the frozen memtable to sstable
             let mut sstable_file =
                 std::fs::File::create(sstable_path.clone()).expect("could not create sstable file");
-            write_to_sstable(frozen_memtable.iter(), &mut sstable_file, &self.config)?;
+            let mut sstable_writer = SSTableWriter::new(&mut sstable_file, &self.config);
+            for (key, value) in frozen_memtable.iter() {
+                sstable_writer.push(key, value)?;
+            }
+            sstable_writer.flush()?;
             sstable_file.sync_all()?;
             std::mem::drop(sstable_file);
 
             self.sstables_l0
-                .push_front(SSTableReader::from_path(&sstable_path)?);
+                .push_front(SSTableReader::new(&sstable_path)?);
             match (
                 frozen_memtable.first_key_value(),
                 frozen_memtable.last_key_value(),

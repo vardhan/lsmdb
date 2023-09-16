@@ -1,35 +1,55 @@
 use std::{
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
+    ops::Bound,
 };
 
+use crate::db::{
+    sstable::{SSTableError, SSTableReader},
+    Memtable,
+};
 use crate::db::{EntryValue, Key, Value};
 
 // DBIteratorItem is an element in priority queue used for DB::scan().
 pub(crate) struct DBIteratorItem<'a>(
     pub(crate) DBIteratorItemPeekable<'a>,
-    pub(crate) DBIteratorPrecedence,
+    pub(crate) DBIteratorItemPrecedence,
 );
-pub(crate) type DBIteratorPrecedence = u32; // smaller is newer.  active memtable has 0, frozen memtables have 1..N, and sstables have N+1..
-
-// This is a container for a peekable iterator for iterating over memtable or sstable.
+pub(crate) type DBIteratorItemPrecedence = u32; // smaller is newer. active memtable has 0, frozen memtables have 1..N, and sstables have N+1..
+                                                // This is a container for a peekable iterator for iterating over memtable or sstable.
 pub(crate) struct DBIteratorItemPeekable<'a> {
     next: Option<(Key, EntryValue)>, // this is the item next() and peek() will return
-    iter: Box<dyn Iterator<Item = (Key, EntryValue)> + 'a>, //
+    iter: Box<dyn Iterator<Item = (Key, EntryValue)> + 'a>,
 }
 
 impl<'a> DBIteratorItemPeekable<'a> {
-    pub(crate) fn new(
-        mut iter: Box<dyn Iterator<Item = (Key, EntryValue)> + 'a>,
-    ) -> DBIteratorItemPeekable {
+    fn new(mut iter: Box<dyn Iterator<Item = (Key, EntryValue)> + 'a>) -> DBIteratorItemPeekable {
         let next = iter.next();
         DBIteratorItemPeekable { next, iter }
     }
 
+    pub(crate) fn from_sstable(
+        reader: &'a mut SSTableReader,
+        key_prefix: &str,
+    ) -> Result<DBIteratorItemPeekable<'a>, SSTableError> {
+        reader
+            .scan(key_prefix, false)
+            .map(|iter| DBIteratorItemPeekable::new(Box::new(iter)))
+    }
+
+    pub(crate) fn from_memtable(
+        memtable: &'a Memtable,
+        key_prefix: &str,
+    ) -> DBIteratorItemPeekable<'a> {
+        DBIteratorItemPeekable::new(Box::new(
+            memtable
+                .range((Bound::Included(key_prefix.to_string()), Bound::Unbounded))
+                .map(|(key, entry_val)| (key.clone(), entry_val.clone())),
+        ))
+    }
+
     pub(crate) fn next(&mut self) -> Option<(Key, EntryValue)> {
-        let next = std::mem::take(&mut self.next);
-        self.next = self.iter.next();
-        next
+        std::mem::replace(&mut self.next, self.iter.next())
     }
 
     pub(crate) fn peek(&self) -> Option<&(Key, EntryValue)> {
@@ -37,8 +57,9 @@ impl<'a> DBIteratorItemPeekable<'a> {
     }
 }
 
-impl<'a> Ord for DBIteratorItem<'a> {
+impl Ord for DBIteratorItem<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
+        // is `self` Less or Greater than `other` ?
         match (&self.0.peek(), &other.0.peek()) {
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
@@ -73,31 +94,38 @@ pub struct DBIterator<'a> {
     pub(crate) key_prefix: Key,
 }
 
+// impl<'a> DBIterator<'a> {
+//     pub(crate) fn new(iterators: , key_prefix: Key)
+// }
+
 impl<'a> Iterator for DBIterator<'a> {
     type Item = (Key, Value);
 
     fn next(&mut self) -> Option<Self::Item> {
         'pop_key_val: loop {
-            self.iterators.peek()?;
             // 1. Take out the smallest iterator (we have to put it back at the end)
-            let mut top_memtable = self.iterators.pop();
-            let top_kv = match top_memtable {
-                None => return None, // There are no more memtables.
+            let mut top_iter = self.iterators.pop();
+            let top_kv = match top_iter {
+                None => return None, // There are no more items in the iterator.
                 Some(Reverse(DBIteratorItem(ref mut db_iter_peekable, _))) => {
                     db_iter_peekable.next()
                 }
             };
 
             match top_kv {
+                // If we hit an iterator that's empty, it implies that all iterators are empty,
+                // so we can early-exit.
+                None => return None,
                 Some((key, entry_value)) => {
-                    if !key.starts_with(self.key_prefix.as_str()) {
+                    // 2. Early-exit if we're past the key_prefix.
+                    if !key.starts_with(&self.key_prefix) {
                         return None;
                     }
-                    // 2. Skip any duplicates of this key -- we already have the newest one.
+                    // 3. Skip any duplicates of this key -- we already have the newest one.
                     self.skip_entries_with_key(&key);
 
-                    // 3. Put the memtable iterator back into the heap and return the entry
-                    self.iterators.push(top_memtable.unwrap());
+                    // 4. Put the iterator back into the binary heap and return the entry
+                    self.iterators.push(top_iter.unwrap());
 
                     match entry_value {
                         EntryValue::Present(value) => {
@@ -108,15 +136,12 @@ impl<'a> Iterator for DBIterator<'a> {
                         } // deleted -- try the next key value.
                     }
                 }
-                // If we hit an memtable iterator that's empty, it implies that all iterators are empty,
-                // so we can early-exit this iterator.
-                None => return None,
             };
         }
     }
 }
 
-impl<'a> DBIterator<'a> {
+impl DBIterator<'_> {
     fn peek_next_key(&mut self) -> Option<&Key> {
         let next_memtable = self.iterators.peek();
         next_memtable?;

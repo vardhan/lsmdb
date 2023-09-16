@@ -7,12 +7,15 @@ use std::{
     string::FromUtf8Error
 };
 
+
 use thiserror::Error;
 
 use crate::db::{EntryValue, Key, Value, DBConfig};
 
 use super::reader_ext::ReaderExt;
 
+// This file provides functionality to read from, write to, and iterator over SSTable files.
+//
 // SSTable file format
 // ===================
 //
@@ -57,21 +60,31 @@ use super::reader_ext::ReaderExt;
 // - ..
 // - size of sstable index in bytes (u32; LE)
 pub(crate) struct SSTableReader {
+    path: PathBuf,
+
     file: File,
 
     // (last_key, block byte offset, block size), sorted by last_key ascending.
     block_index: Vec<(String, u32, u32)>,
 }
-
 // TODO: mmap an sstable files into memory instead of doing File I/O directly.
 impl SSTableReader {
     /// Reads the SSTable file located at `path`.
     ///
     /// Returns an error if the SSTable's index is corrupt or malformed.
-    pub fn from_path(path: &PathBuf) -> Result<Self, SSTableError> {
+    pub(crate) fn new(path: &PathBuf) -> Result<Self, SSTableError> {
         let mut file: File = std::fs::File::open(path.clone())?;
         let block_index: Vec<(String, u32, u32)> = Self::parse_index(&mut file)?;
-        Ok(SSTableReader { file, block_index })
+        Ok(SSTableReader { path: path.clone(), file, block_index })
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, SSTableError> {
+        SSTableReader::new(&self.path)
+    }
+
+    /// The byte size of the file backing this SSTable.
+    pub(crate) fn size(&self) -> Result<u64, SSTableError> {
+        Ok(self.file.metadata()?.len())
     }
 
     fn parse_index(reader: &mut File) -> Result<Vec<(String, u32, u32)>, SSTableError> {
@@ -138,8 +151,8 @@ impl SSTableReader {
     }
 
     /// Iterates the SSTable for keys beginning with `key_prefix`.
-    /// Iterator yields keys in ascending sorted order.
-    pub(crate) fn scan(&mut self, key_prefix: &str) -> Result<SSTableIterator, SSTableError> {
+    /// Iterator yields keys in ascending sorted order. Deleted entries are skipped.
+    pub(crate) fn scan(&mut self, key_prefix: &str, skip_deleted: bool) -> Result<SSTableIterator, SSTableError> {
         let (block_idx, mut block_reader) = match self.get_candidate_block(key_prefix) {
             Some(idx) => {
                 let (_, block_offset, block_size) = self.block_index[idx];
@@ -155,6 +168,7 @@ impl SSTableReader {
                 Ok(SSTableIterator {
                         key_prefix: key_prefix.to_string(),
                         sst_reader: Some(self),
+                        skip_deleted,
                         // (block index, block reader)
                         cur_block: Some((block_idx, block_reader)),
                 })
@@ -169,12 +183,13 @@ impl SSTableReader {
 pub(crate) struct SSTableIterator<'a> {
     key_prefix: String,
     sst_reader: Option<&'a mut SSTableReader>,
+    skip_deleted: bool,
     // (block index, block reader)
     cur_block: Option<(usize, BlockReader<File>)>,
 }
 impl SSTableIterator<'_> {
     fn empty() -> SSTableIterator<'static> {
-        SSTableIterator { key_prefix: "".to_string(), sst_reader: None, cur_block: None }
+        SSTableIterator { key_prefix: "".to_string(), sst_reader: None, skip_deleted: true, cur_block: None }
     }
 }
 impl<'a> Iterator for SSTableIterator<'a> {
@@ -193,8 +208,12 @@ impl<'a> Iterator for SSTableIterator<'a> {
             let (_cur_block_idx, ref mut cur_block_reader) = self.cur_block.as_mut().unwrap();
             match cur_block_reader.read_next_entry() {
                 Ok((key, EntryValue::Present(value))) if key.starts_with(&self.key_prefix) => return Some((key, EntryValue::Present(value))),
-                Ok((key, EntryValue::Deleted)) if key.starts_with(&self.key_prefix) => continue 'read_block_entry,
-                // key start with self.key_prefix?
+                Ok((key, EntryValue::Deleted)) if key.starts_with(&self.key_prefix) => {
+                    if self.skip_deleted {
+                        continue 'read_block_entry;
+                    }
+                    return Some((key, EntryValue::Deleted));
+                },
                 Ok(_) => return None,
                 Err(SSTableError::KeyPrefixNotFound) => return None,
                 Err(SSTableError::EndOfBlock) => {
@@ -223,57 +242,120 @@ impl<'a> Iterator for SSTableIterator<'a> {
         }
     }
 }
+pub(crate) struct SSTableWriter<'w,'c, W> {
+    /// Underlying writer to write the sstable to
+    writer: &'w mut W,
 
-pub(crate) fn write_to_sstable<'k>(
-    kv_iter: impl Iterator<Item=(&'k Key, &'k EntryValue)>,
-    writer: &mut impl Write,
-    db_config: &DBConfig,
-) -> Result<(), SSTableError> {
-    let mut block_writer = BlockWriter::new(db_config);
-    // `block_sizes` is a list of block size entries.
-    // each entry is:  # of bytes in the block, last key in the block.
-    let mut block_sizes: Vec<(usize, String)> = Vec::new();
+    /// Number of bytes written so far to the writer.
+    bytes_written_so_far: usize,
 
-    // write out all the keys
-    for (key, entry) in kv_iter {
-        match block_writer.add_to_block(&key, &entry) {
-            Ok(()) => {}
+    /// A running count of the sstable index byte size, used for computing the size() of the sstable so far.
+    sstable_index_byte_size: usize,
+
+    /// the byte size of the most recently written key, used for computing the size() of the sstable so far.
+    prev_key_byte_size: usize,
+
+    db_config: &'c DBConfig,
+
+    /// current block to write to.
+    cur_block_writer: BlockWriter<'c>,
+
+    /// `block_sizes` is a list of block size entries.
+    /// each entry is:  # of bytes in the block, last key in the block.
+    /// As blocks. This gets appended to the writer when the SSTable is finalized
+    block_sizes: Vec<(usize, String)>,
+}
+
+impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
+    pub(crate) fn new(writer: &'w mut W, db_config: &'c DBConfig) -> SSTableWriter<'w, 'c, W> {
+        let sstable_index_byte_size =
+            size_of::<u32>(); // byte size of the sstable index (u32)
+        SSTableWriter{
+            writer,
+            bytes_written_so_far: 0,
+            sstable_index_byte_size,
+            prev_key_byte_size: 0,
+            db_config,
+            cur_block_writer: BlockWriter::new(db_config),
+            block_sizes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, key: &Key, entry: &EntryValue) -> Result<(), SSTableError>{
+        match self.cur_block_writer.push(key, entry) {
+            Ok(bytes_written) => {
+                self.bytes_written_so_far += bytes_written;
+            }
             Err(SSTableError::BlockSizeOverflow) => {
                 // flush the current block to the `writer`, make a new block and add entry to it.
-                block_sizes.push(block_writer.flush(writer)?);
-                block_writer = BlockWriter::new(db_config);
-                block_writer
-                    .add_to_block(&key, &entry)
+                let prev_block_writer = std::mem::replace(&mut self.cur_block_writer, BlockWriter::new(self.db_config));
+                let (block_size, last_key) = prev_block_writer.flush(self.writer)?;
+                self.sstable_index_byte_size +=
+                    size_of::<u32>() // block size (u32)
+                    + size_of::<u32>() // to store the byte size of the last key
+                    + last_key.as_bytes().len() // # of bytes in the last key
+                ;
+                self.block_sizes.push((block_size, last_key));
+                self.bytes_written_so_far += block_size;
+                self.cur_block_writer = BlockWriter::new(self.db_config);
+                self.bytes_written_so_far += self.cur_block_writer
+                    .push(key, entry)
                     .expect("single key/value won't fit in block");
             }
             Err(err) => return Err(err),
         }
+        self.prev_key_byte_size = key.as_bytes().len();
+        Ok(())
     }
 
-    // flush the last block.
-    block_sizes.push(block_writer.flush(writer)?);
-
-    // write out the sstable index (i.e., the footer):
-    // - block #1 size in bytes (4 bytes), last key length (4 bytes), last key (variable length)
-    // - block #2 ..
-    // - ..
-    // - sstable index size (4 bytes)
-    //
-    // NOTE: the above might be out-of-sync -- see top of this file for source of truth.
-    let mut index_size = 0u32;
-    for (block_size, last_key) in block_sizes {
-        index_size += size_of::<u32>() as u32;
-        writer.write_all(&(block_size as u32).to_le_bytes())?;
-
-        index_size += size_of::<u32>() as u32;
-        writer.write_all(&(last_key.len() as u32).to_le_bytes())?;
-
-        let last_key_bytes = last_key.as_bytes();
-        index_size += last_key_bytes.len() as u32;
-        writer.write_all(last_key_bytes)?;
+    /// Computed size of the sstable if it were to be flush()'d.
+    pub(crate) fn size(&self) -> usize {
+        // written bytes so far + size of the sstable index so far + pending final block entry sstable
+        self.bytes_written_so_far + self.sstable_index_byte_size
+         + (size_of::<u32>() + self.prev_key_byte_size) // (last key byte size, the last key)
     }
-    writer.write_all(&index_size.to_le_bytes())?;
 
+    /// Flushes the sstable index.
+    /// After this call, the sstable file is ready to be used with SSTableReader.
+    pub(crate) fn flush(mut self) -> Result<(), SSTableError> {
+        // flush the last block.
+        self.block_sizes.push(self.cur_block_writer.flush(self.writer)?);
+
+        // write out the sstable index (i.e., the footer):
+        // - block #1 size in bytes (4 bytes), last key length (4 bytes), last key (variable length)
+        // - block #2 ..
+        // - ..
+        // - sstable index size (4 bytes)
+        //
+        // NOTE: the above might be out-of-sync -- see top of this file for source of truth.
+        let mut index_size = 0u32;
+        for (block_size, last_key) in self.block_sizes {
+            index_size += size_of::<u32>() as u32;
+            self.writer.write_all(&(block_size as u32).to_le_bytes())?;
+
+            index_size += size_of::<u32>() as u32;
+            self.writer.write_all(&(last_key.len() as u32).to_le_bytes())?;
+
+            let last_key_bytes = last_key.as_bytes();
+            index_size += last_key_bytes.len() as u32;
+            self.writer.write_all(last_key_bytes)?;
+        }
+        self.writer.write_all(&index_size.to_le_bytes())?;
+
+        Ok(())
+    }
+}
+
+pub(crate) fn write_to_sstable<'kv>(
+    kv_iter: impl Iterator<Item=&'kv (Key, EntryValue)>,
+    writer: &mut impl Write,
+    db_config: &DBConfig,
+) -> Result<(), SSTableError> {
+    let mut ss_writer = SSTableWriter::new(writer, db_config);
+    for (ref key, ref value) in kv_iter {
+        ss_writer.push(key, value)?;
+    }
+    ss_writer.flush()?;
     Ok(())
 }
 
@@ -291,8 +373,6 @@ pub(crate) enum SSTableError {
     KeyPrefixNotFound,
     #[error("Reached the end of block")]
     EndOfBlock,
-    #[error("Reached the end of SSTable")]
-    EndOfSSTable,
     // TODO:  Replace `Custom` with specific error codes
     #[error("SSTableError: {0}")]
     Custom(&'static str),
@@ -302,25 +382,25 @@ pub(crate) enum SSTableError {
 
 const BLOCK_NUM_ENTRIES_SIZEOF: usize = size_of::<u32>();
 pub(crate) struct BlockWriter<'c> {
-    // Encoding of a single block:
-    //   - entry #1
-    //     - key length (4 bytes)
-    //     - value length (4 bytes)
-    //     - key (variable length)
-    //     - indicator for Present (1) or Deleted (0).  (1 byte)
-    //     - value (variable length)
-    //   - entry #2
-    //     ...
-    //   - byte offset of entry #1 (4 bytes)
-    //   - byte offset of entry #2 (4 bytes)
-    //     ...
-    //   - number of entries (4 bytes)
     db_config: &'c DBConfig,
     block_data: Vec<u8>,
     block_footer: Vec<u8>,
     last_key: Option<String>,
 }
 
+// Encoding of a single block:
+//   - entry #1
+//     - key length (4 bytes)
+//     - value length (4 bytes)
+//     - key (variable length)
+//     - indicator for Present (1) or Deleted (0).  (1 byte)
+//     - value (variable length)
+//   - entry #2
+//     ...
+//   - byte offset of entry #1 (4 bytes)
+//   - byte offset of entry #2 (4 bytes)
+//     ...
+//   - number of entries (4 bytes)
 impl<'c> BlockWriter<'c> {
     pub fn new(db_config: &'c DBConfig) -> Self {
         BlockWriter {
@@ -331,8 +411,11 @@ impl<'c> BlockWriter<'c> {
         }
     }
 
-    // Appends the given `entry` to the current block. Returns an error if there is not enough space for the entry
-    pub fn add_to_block(&mut self, key: &str, entry: &EntryValue) -> Result<(), SSTableError> {
+    /// Appends the given `entry` to the current block.
+    ///
+    /// Returns the number of bytes the (key,entry) took up.
+    /// Returns an error if there is not enough space in the block for the (key,entry).
+    pub fn push(&mut self, key: &str, entry: &EntryValue) -> Result<usize, SSTableError> {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len();
         let value_len = entry.len();
@@ -349,7 +432,7 @@ impl<'c> BlockWriter<'c> {
             }
             + size_of::<u32>() // byte offset for block footer
             ;
-        if self.block_size() + entry_size > self.db_config.block_max_size_bytes {
+        if self.size() + entry_size > self.db_config.block_max_size_bytes {
             return Err(SSTableError::BlockSizeOverflow);
         }
         self.block_data.write_all(&(key_len as u32).to_le_bytes())?;
@@ -368,24 +451,25 @@ impl<'c> BlockWriter<'c> {
         self.block_footer
             .write_all(&(entry_offset as u32).to_le_bytes())?;
         self.last_key = Some(key.to_string());
-        Ok(())
+        Ok(entry_size)
     }
 
-    fn block_size(&self) -> usize {
+    /// An estimated size of the block so far.
+    fn size(&self) -> usize {
         self.block_data.len() + self.block_footer.len() + BLOCK_NUM_ENTRIES_SIZEOF
     }
 
-    // Flushes the entire block using the given `writer`.
-    //
-    // Returns:
-    //  - number of bytes in the block
-    //  - the last key in the block
+    /// Flushes the entire block using the given `writer`.
+    ///
+    /// Returns:
+    ///  - number of bytes in the block
+    ///  - the last key in the block
     pub fn flush(self, writer: &mut dyn Write) -> Result<(usize, String), std::io::Error> {
         writer.write_all(&self.block_data)?;
         writer.write_all(&self.block_footer)?;
         let num_entries = self.block_footer.len() / size_of::<u32>();
         writer.write(&(num_entries as u32).to_le_bytes())?;
-        let block_size = self.block_size();
+        let block_size = self.size();
         Ok((block_size, self.last_key.unwrap()))
     }
 }
@@ -397,7 +481,7 @@ pub(crate) struct BlockReader<R: Read + Seek> {
     reader: R,
     block_offset: u32,
     num_entries: u32,
-    entry_offsets: Vec<u32>,
+    // entry_offsets: Vec<u32>,
     entry_cursor: u32 // cursor for the next entry
 }
 
@@ -432,7 +516,7 @@ impl<R: Read + Seek> BlockReader<R> {
             reader,
             block_offset,
             num_entries,
-            entry_offsets,
+            // entry_offsets,
             entry_cursor: 0
         })
     }
@@ -546,9 +630,7 @@ impl<'k, 'r, R: Read + Seek + 'r> Iterator for BlockIterator<'k, 'r, R> {
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        db::{DBConfig, DB, sstable::{SSTableError, SSTableReader, BlockReader, BlockWriter}, EntryValue},
-    };
+    use crate::db::{DBConfig, DB, sstable::{SSTableError, SSTableReader, BlockReader, BlockWriter}, EntryValue};
     use std::io::Cursor;
     use tempdir::TempDir;
 
@@ -558,7 +640,7 @@ mod test {
         let mut buffer = Vec::new();
         let mut writer = BlockWriter::new(&db_config);
         writer
-            .add_to_block("/keyspace/keyname", &EntryValue::Present(b"value of the key".to_vec()))
+            .push("/keyspace/keyname", &EntryValue::Present(b"value of the key".to_vec()))
             .expect("write to block");
         let (bytes_written, last_key) = writer.flush(&mut buffer).expect("write to buffer");
 
@@ -579,16 +661,16 @@ mod test {
         let mut mem = Cursor::new(Vec::<u8>::new());
         let mut writer = BlockWriter::new(&db_config);
         writer
-            .add_to_block("/key1", &EntryValue::Present(vec![1, 2, 3]))
+            .push("/key1", &EntryValue::Present(vec![1, 2, 3]))
             .expect("cant put /key1");
         writer
-            .add_to_block("/key2", &EntryValue::Present(vec![4, 5, 6]))
+            .push("/key2", &EntryValue::Present(vec![4, 5, 6]))
             .expect("cant put /key2");
         writer
-            .add_to_block("/key3", &EntryValue::Deleted)
+            .push("/key3", &EntryValue::Deleted)
             .expect("cant delete /key3");
         writer
-            .add_to_block("/key4", &EntryValue::Present(vec![7, 8, 9]))
+            .push("/key4", &EntryValue::Present(vec![7, 8, 9]))
             .expect("cant put /key4");
 
         let (size, last_key) = writer.flush(&mut mem).expect("could not flush");
@@ -619,19 +701,16 @@ mod test {
         let db_config = DBConfig::default();
         let mut writer = BlockWriter::new(&db_config);
         for i in 0..68 {
-            assert_eq!(
-                writer
-                    .add_to_block(
-                        format!("/user/username_{0}", i).as_str(),
-                        &EntryValue::Present((0..30).collect()),
-                    )
-                    .expect("failed to put"),
-                ()
-            );
+            writer
+                .push(
+                    format!("/user/username_{0}", i).as_str(),
+                    &EntryValue::Present((0..30).collect()),
+                )
+                .expect("failed to put");
         }
-        assert!(writer.block_size() < db_config.block_max_size_bytes);
+        assert!(writer.size() < db_config.block_max_size_bytes);
         assert!(matches!(
-            writer.add_to_block(
+            writer.push(
                 "/user/username_30495",
                 &EntryValue::Present((0..30).collect())
             ),
@@ -642,13 +721,13 @@ mod test {
     #[test]
     fn sstable_seek_across_all_blocks() {
         let tempdir = TempDir::new("lsmdb_test").expect("couldnt make a temp dir");
-        let NUM_ENTRIES = 300;
+        let num_entries = 300;
         let mut db = DB::open_with_config(
             tempdir.path(),
             DBConfig {
                 // don't auto-write to sstable; this test triggers that manually
                 max_frozen_memtables: 4,
-                block_max_size_bytes: NUM_ENTRIES, // this should force multiple blocks to be written
+                block_max_size_bytes: num_entries, // this should force multiple blocks to be written
                 ..DBConfig::default()
             },
         )
@@ -674,7 +753,7 @@ mod test {
         assert!(sstables.len() == 1);
         assert!(sstables[0].block_index.len() > 1); // there should be multiple blocks
 
-        let actual_kvs: Vec<_> = sstables[0].scan("/key/").unwrap().collect();
+        let actual_kvs: Vec<_> = sstables[0].scan("/key/", true).unwrap().collect();
 
         assert_eq!(expected_keys.len(), actual_kvs.len());
 
@@ -722,7 +801,7 @@ mod test {
         for (_key_range, path) in all_levels[0] {
             // let mut file = std::fs::File::open(path.clone()).expect("couldnt open file");
             let mut sstable =
-                SSTableReader::from_path(&tempdir.path().join(path))
+                SSTableReader::new(&tempdir.path().join(path))
                     .unwrap_or_else(|_| panic!("couldnt open sstable {}", path));
             for i in 0..num_keys_to_generate {
                 // this key should exist
