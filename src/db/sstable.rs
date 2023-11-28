@@ -78,6 +78,7 @@ impl SSTableReader {
         Ok(SSTableReader { path: path.clone(), file, block_index })
     }
 
+    /// Returns the try clone of this [`SSTableReader`].
     pub(crate) fn try_clone(&self) -> Result<Self, SSTableError> {
         SSTableReader::new(&self.path)
     }
@@ -152,7 +153,7 @@ impl SSTableReader {
 
     /// Iterates the SSTable for keys beginning with `key_prefix`.
     /// Iterator yields keys in ascending sorted order. Deleted entries are skipped.
-    pub(crate) fn scan(&mut self, key_prefix: &str, skip_deleted: bool) -> Result<SSTableIterator, SSTableError> {
+    pub(crate) fn scan(&self, key_prefix: &str, skip_deleted: bool) -> Result<SSTableIterator, SSTableError> {
         let (block_idx, mut block_reader) = match self.get_candidate_block(key_prefix) {
             Some(idx) => {
                 let (_, block_offset, block_size) = self.block_index[idx];
@@ -167,7 +168,7 @@ impl SSTableReader {
             Ok(_) =>  {
                 Ok(SSTableIterator {
                         key_prefix: key_prefix.to_string(),
-                        sst_reader: Some(self),
+                        sst_reader: Some(self.try_clone().unwrap()),
                         skip_deleted,
                         // (block index, block reader)
                         cur_block: Some((block_idx, block_reader)),
@@ -180,19 +181,19 @@ impl SSTableReader {
 }
 
 /// This iterator is constructed using [`SSTableReader::scan`].
-pub(crate) struct SSTableIterator<'a> {
+pub(crate) struct SSTableIterator {
     key_prefix: String,
-    sst_reader: Option<&'a mut SSTableReader>,
+    sst_reader: Option<SSTableReader>,
     skip_deleted: bool,
     // (block index, block reader)
     cur_block: Option<(usize, BlockReader<File>)>,
 }
-impl SSTableIterator<'_> {
-    fn empty() -> SSTableIterator<'static> {
+impl SSTableIterator {
+    fn empty() -> SSTableIterator {
         SSTableIterator { key_prefix: "".to_string(), sst_reader: None, skip_deleted: true, cur_block: None }
     }
 }
-impl<'a> Iterator for SSTableIterator<'a> {
+impl<'a> Iterator for SSTableIterator {
     type Item = (Key, EntryValue);
 
     /// next() scans through blocks looking for the `key_prefix` used to construct this Iterator.
@@ -751,9 +752,9 @@ mod test {
 
         let sstables = db.get_sstables_mut();
         assert!(sstables.len() == 1);
-        assert!(sstables[0].block_index.len() > 1); // there should be multiple blocks
+        assert!(sstables[0].1.block_index.len() > 1); // there should be multiple blocks
 
-        let actual_kvs: Vec<_> = sstables[0].scan("/key/", true).unwrap().collect();
+        let actual_kvs: Vec<_> = sstables[0].1.scan("/key/", true).unwrap().collect();
 
         assert_eq!(expected_keys.len(), actual_kvs.len());
 
@@ -795,7 +796,7 @@ mod test {
             .expect("could not freeze active memtable");
         db.flush_frozen_memtables_to_sstable()
             .expect("could not flush frozen memtable");
-        let all_levels = db.manifest.levels().collect::<Vec<_>>();
+        let all_levels = db.manifest.iter_levels().collect::<Vec<_>>();
         assert!(all_levels.len() == 1);
         assert!(all_levels[0].len() == 1);
         for (_key_range, path) in all_levels[0] {

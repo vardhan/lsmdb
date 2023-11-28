@@ -27,7 +27,7 @@ use thiserror::Error;
 /// See [`ManifestOp`] for the various kinds of log records in the manifest.
 
 /// Used to express the key-range of an SSTable.
-#[derive(Serialize, Deserialize, PartialOrd, PartialEq, Eq, Ord, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialOrd, PartialEq, Eq, Ord, Debug)]
 pub(crate) struct KeyRange {
     pub smallest: String, // smallest key in the sstable
     pub largest: String,  // largest key in the sstable
@@ -84,7 +84,7 @@ pub(crate) enum ManifestOp {
     // This means level n-1 is now empty, and level n's files are replaced with the new, given files.
     MergeLevel {
         to_level: usize,
-        new_level_files: Vec<(KeyRange, String)>,
+        sstables: Vec<(KeyRange, String)>,
     },
 }
 
@@ -147,6 +147,7 @@ impl Manifest {
         &self.root_dir
     }
 
+    /// Parses the operation and mutates the given `levels`.
     fn parse_op(
         levels: &mut Vec<Vec<(KeyRange, String)>>,
         op: ManifestOp,
@@ -158,23 +159,25 @@ impl Manifest {
                 }
                 levels[0].push((key_range, file));
             }
-            ManifestOp::MergeLevel {
-                to_level,
-                new_level_files,
-            } if to_level > 0 => {
-                // uhoh: we are trying to merge into a level which is higher than a new level.
+            ManifestOp::MergeLevel { to_level, sstables } if to_level > 0 => {
                 if to_level > levels.len() {
+                    // uhoh: we are trying to merge into a level which is higher than a new level.
                     return Err(ManifestError::MergeLevelInvalid { to_level });
                 }
                 levels[to_level - 1].clear();
-                levels[to_level] = new_level_files;
+                if to_level == levels.len() {
+                    levels.push(sstables);
+                } else {
+                    levels[to_level] = sstables;
+                }
             }
             _ => return Err(ManifestError::OpParseError { op }),
         }
         Ok(())
     }
 
-    pub(crate) fn add_sstable(
+    /// Add the given SSTable to level 0
+    pub(crate) fn add_sstable_l0(
         &mut self,
         file_name: String,
         key_range: KeyRange,
@@ -185,13 +188,38 @@ impl Manifest {
         };
         let log_record = format!("\n{}", serde_json::to_string::<ManifestOp>(&op)?);
         self.manifest_file.write_all(log_record.as_bytes())?;
+        self.manifest_file.flush()?;
         Self::parse_op(&mut self.levels, op)?;
         self.levels[0].sort(); // keep level 0 sorted
         Ok(())
     }
 
-    pub(crate) fn levels(&self) -> impl Iterator<Item = &Vec<(KeyRange, std::string::String)>> {
+    /// Record a new set of SSTables for level `to_level`, and clear out the sstables
+    /// for level `level`.
+    pub(crate) fn merge_level(
+        &mut self,
+        sstables: Vec<(KeyRange, String)>,
+        to_level: usize,
+    ) -> Result<(), ManifestError> {
+        let op = ManifestOp::MergeLevel { to_level, sstables };
+        let log_record = format!("\n{}", serde_json::to_string::<ManifestOp>(&op)?);
+        self.manifest_file.write_all(log_record.as_bytes())?;
+        self.manifest_file.flush()?;
+        Self::parse_op(&mut self.levels, op)?;
+        Ok(())
+    }
+
+    pub(crate) fn iter_levels(
+        &self,
+    ) -> impl Iterator<Item = &Vec<(KeyRange, std::string::String)>> {
         self.levels.iter()
+    }
+
+    pub(crate) fn iter_level_files(
+        &self,
+        level: usize,
+    ) -> impl Iterator<Item = &(KeyRange, String)> {
+        self.levels[level].iter()
     }
 }
 
@@ -269,42 +297,120 @@ mod test {
 
     #[test]
     fn merge_level() -> anyhow::Result<()> {
-        let tmp = TempDir::new("db")?;
-        fs::write(tmp.path().join("CURRENT"), "MANIFEST-42")?;
+        let tmp1 = TempDir::new("db1")?;
+        let tmp2 = TempDir::new("db2")?;
+        fs::write(tmp1.path().join("CURRENT"), "MANIFEST-42")?;
         fs::write(
-            tmp.path().join("MANIFEST-42"),
+            tmp1.path().join("MANIFEST-42"),
             [r#"{"AddSSTable":{"key_range":{"smallest":"/ghi","largest":"/jkl"},"file":"1.sst"}}"#,
                     r#"{"AddSSTable":{"key_range":{"smallest":"/mno","largest":"/pqr"},"file":"2.sst"}}"#,
-                    r#"{"AddSSTable":{"key_range":{"smallest":"/abc","largest":"/def"},"file":"0.sst"}}"#]
+                    r#"{"AddSSTable":{"key_range":{"smallest":"/abc","largest":"/def"},"file":"0.sst"}}"#,
+                    r#"{"MergeLevel":{"to_level":1,"sstables":[[{"smallest":"/abc","largest":"/pqr"}, "3.sst"]]}}"#,
+                    r#"{"AddSSTable":{"key_range":{"smallest":"/xyx","largest":"/xzz"},"file":"4.sst"}}"#,
+                    r#"{"MergeLevel":{"to_level":1,"sstables":[[{"smallest":"/abc","largest":"/jkl"}, "5.sst"], [{"smallest":"/mno","largest":"/xzz"}, "6.sst"]]}}"#,
+                    r#"{"AddSSTable":{"key_range":{"smallest":"/abc","largest":"/def"},"file":"7.sst"}}"#,
+                    ]
                 .join("\n"),
         )?;
-        let manifest = Manifest::open(&tmp.path().to_path_buf())?;
-        assert_eq!(
-            vec![vec![
+        // `manifest` is used to test that the JSON input was parsed out correctly
+        let manifest = Manifest::open(&tmp1.path().to_path_buf())?;
+        // `manifest2` is populated to be the same as `manifest`, but using the `Manifest` API.
+        let mut manifest2 = Manifest::open(&tmp2.path().to_path_buf())?;
+        manifest2.add_sstable_l0(
+            "0.sst".to_string(),
+            KeyRange {
+                smallest: "/abc".to_string(),
+                largest: "/def".to_string(),
+            },
+        )?;
+        manifest2.add_sstable_l0(
+            "1.sst".to_string(),
+            KeyRange {
+                smallest: "/ghi".to_string(),
+                largest: "/jkl".to_string(),
+            },
+        )?;
+        manifest2.add_sstable_l0(
+            "2.sst".to_string(),
+            KeyRange {
+                smallest: "/mno".to_string(),
+                largest: "/pqr".to_string(),
+            },
+        )?;
+        manifest2.merge_level(
+            vec![(
+                KeyRange {
+                    smallest: "/abc".to_string(),
+                    largest: "/pqr".to_string(),
+                },
+                "3.sst".to_string(),
+            )],
+            1,
+        )?;
+        manifest2.add_sstable_l0(
+            "4.sst".to_string(),
+            KeyRange {
+                smallest: "/xyx".to_string(),
+                largest: "/xzz".to_string(),
+            },
+        )?;
+        manifest2.merge_level(
+            vec![
                 (
                     KeyRange {
                         smallest: "/abc".to_string(),
-                        largest: "/def".to_string(),
-                    },
-                    "0.sst".to_string()
-                ),
-                (
-                    KeyRange {
-                        smallest: "/ghi".to_string(),
                         largest: "/jkl".to_string(),
                     },
-                    "1.sst".to_string()
+                    "5.sst".to_string(),
                 ),
                 (
                     KeyRange {
                         smallest: "/mno".to_string(),
-                        largest: "/pqr".to_string(),
+                        largest: "/xzz".to_string(),
                     },
-                    "2.sst".to_string()
+                    "6.sst".to_string(),
                 ),
-            ]],
+            ],
+            1,
+        )?;
+        manifest2.add_sstable_l0(
+            "7.sst".to_string(),
+            KeyRange {
+                smallest: "/abc".to_string(),
+                largest: "/def".to_string(),
+            },
+        )?;
+        assert_eq!(
+            vec![
+                // level 0 should have /abc -> /def
+                vec![(
+                    KeyRange {
+                        smallest: "/abc".to_string(),
+                        largest: "/def".to_string(),
+                    },
+                    "7.sst".to_string()
+                )],
+                // level 1 should merge all the files (and keyspace) in level 0
+                vec![
+                    (
+                        KeyRange {
+                            smallest: "/abc".to_string(),
+                            largest: "/jkl".to_string(),
+                        },
+                        "5.sst".to_string()
+                    ),
+                    (
+                        KeyRange {
+                            smallest: "/mno".to_string(),
+                            largest: "/xzz".to_string(),
+                        },
+                        "6.sst".to_string()
+                    ),
+                ]
+            ],
             manifest.levels
         );
+        assert_eq!(manifest.levels, manifest2.levels);
         Ok(())
     }
 }

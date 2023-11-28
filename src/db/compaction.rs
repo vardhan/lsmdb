@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, collections::VecDeque, path::PathBuf};
+use std::{cmp::Reverse, path::PathBuf};
 
 use crate::{
     db::manifest::KeyRange,
@@ -24,18 +24,20 @@ impl<'p, 'c> Compactor<'p, 'c> {
     ///   The first sstable has precedence over the rest (and so on).
     /// - `level`: the level which the supplied `sstables_in` files are in
     ///
+    /// Returns a merged list of sstables, where each sstable is denoted by the key range it
+    /// contains, and its filename.
+    ///
     /// # Notes
     /// - Caller must garbage collect the files in `sstables_in`
-    /// - Caller must record the new files to the `Manifest`
-    pub(crate) fn compact(
+    /// - Caller must record the new files to the `Manifest` and `DB`
+    pub(crate) fn compact<'r, I: Iterator<Item = SSTableReader>>(
         &self,
-        sstables_in: &mut VecDeque<SSTableReader>,
-        level: u32,
-    ) -> Result<Vec<(KeyRange, PathBuf)>, SSTableError> {
+        sstables_in: I,
+        level_in: u32,
+    ) -> Result<Vec<(KeyRange, String)>, SSTableError> {
         // make a DBIterator out of `sstables_in`.
         let iterators = sstables_in
-            .iter_mut()
-            .map(|reader| DBIteratorItemPeekable::from_sstable(reader, "").unwrap())
+            .map(|reader| DBIteratorItemPeekable::from_sstable(&reader, "").unwrap())
             .enumerate()
             .map(|(precedence, iter)| {
                 Reverse(DBIteratorItem(iter, precedence as DBIteratorItemPrecedence))
@@ -47,16 +49,14 @@ impl<'p, 'c> Compactor<'p, 'c> {
         };
 
         // compute the max size an sstable shard for (level+1) can be
-        let level_max_bytes =
-            self.db_config.sstable_level_base_max_size_bytes * 10_u64.pow(level + 1);
-        let level_max_shards =
-            self.db_config.compaction_level_base_max_shards * 2_u64.pow(level + 1);
+        let level_max_bytes = self.db_config.level_base_max_size_bytes * 10_u64.pow(level_in + 1);
+        let level_max_shards = self.db_config.level_base_max_shards * 2_u64.pow(level_in + 1);
         let shard_max_bytes = level_max_bytes / level_max_shards;
 
-        let mut sstables_out = Vec::new();
+        let mut sstables_out: Vec<(KeyRange, String)> = Vec::new();
 
         let (mut cur_sstable_file, mut cur_sstable_pathbuf) =
-            make_new_sstable_file(self.root_dir, level)?;
+            make_new_sstable_file(self.root_dir, level_in)?;
         let mut cur_sstable_writer: SSTableWriter<'_, '_, std::fs::File> =
             SSTableWriter::new(&mut cur_sstable_file, self.db_config);
         let (mut first_key, mut last_key) = (None, None);
@@ -70,12 +70,12 @@ impl<'p, 'c> Compactor<'p, 'c> {
                         smallest: first_key.unwrap(),
                         largest: last_key.unwrap(),
                     },
-                    cur_sstable_pathbuf,
+                    cur_sstable_pathbuf.to_str().unwrap().to_string(),
                 ));
                 // Rotate a new sstable
                 (first_key, last_key) = (None, None);
                 (cur_sstable_file, cur_sstable_pathbuf) =
-                    make_new_sstable_file(self.root_dir, level)?;
+                    make_new_sstable_file(self.root_dir, level_in)?;
                 cur_sstable_writer = SSTableWriter::new(&mut cur_sstable_file, self.db_config);
             }
             cur_sstable_writer.push(&key, &super::EntryValue::Present(value))?;
@@ -93,7 +93,8 @@ impl<'p, 'c> Compactor<'p, 'c> {
                     smallest: first_key.unwrap(),
                     largest: last_key.unwrap(),
                 },
-                cur_sstable_pathbuf,
+                // FIXME: replace unwrap() with an error.
+                cur_sstable_pathbuf.to_str().unwrap().to_string(),
             ));
         }
 
@@ -146,7 +147,7 @@ mod test {
             let mut key_no = 0;
             while writer.size() < max_per_file_size {
                 writer.push(
-                    &format!("/f/{}/{}", file_no, key_no),
+                    &format!("/f/{:0>5}/{:0>5}", file_no, key_no),
                     &EntryValue::Present(format!("val {}-{}", file_no, key_no).into_bytes()),
                 )?;
                 key_no += 1;
@@ -168,8 +169,8 @@ mod test {
 
         let root_dir: PathBuf = tmpdir.path().into();
         let db_config = DBConfig {
-            compaction_level_base_max_shards: out_num_files, // L1 = OUT_NUM_FILES*2^1
-            sstable_level_base_max_size_bytes: out_level_base_size, // OUT_SHARD_SIZE shards for level 0, OUT_SHARD_SIZE*10 shards for level 1
+            level_base_max_shards: out_num_files, // L1 = OUT_NUM_FILES*2^1
+            level_base_max_size_bytes: out_level_base_size, // OUT_SHARD_SIZE shards for level 0, OUT_SHARD_SIZE*10 shards for level 1
             ..DBConfig::default()
         };
 
@@ -181,10 +182,9 @@ mod test {
         let sstables_in = generate_sstables(&root_dir, &db_config, in_num_files, in_shard_size)?;
 
         let sstables_out = compactor.compact(
-            &mut sstables_in
+            sstables_in
                 .iter()
-                .map(|(pathbuf, _)| SSTableReader::new(pathbuf).unwrap())
-                .collect(),
+                .map(|(pathbuf, _)| SSTableReader::new(pathbuf).unwrap()),
             0,
         )?;
 
@@ -192,12 +192,16 @@ mod test {
         assert_eq!(sstables_out.len(), 3);
 
         // we should see consecutive keys for each file, and the correct key range.
-        for (key_range, sstable_pathbuf) in sstables_out {
-            let mut reader = SSTableReader::new(&sstable_pathbuf)?;
+        for (key_range, sstable_filename) in sstables_out {
+            let reader = SSTableReader::new(&root_dir.join(sstable_filename))?;
             let (mut first_key, mut last_key) = (None, None);
             for (key, _) in reader.scan("", true)? {
                 if first_key.is_none() {
                     first_key = Some(key.clone());
+                }
+                // assert that keys are consecutive
+                if let Some(previous_key) = last_key {
+                    assert!(key > previous_key);
                 }
                 last_key = Some(key);
             }
@@ -221,7 +225,7 @@ mod test {
             .read(true)
             .open(tmpdir.path().join("ss1"))?;
 
-        // delete the even numbered keys
+        // in ss2, we will delete the even numbered keys
         let mut ss2 = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -255,22 +259,24 @@ mod test {
         )?;
 
         let ss1_reader = SSTableReader::new(&tmpdir.path().join("ss1")).unwrap();
-        let mut ss2_reader = SSTableReader::new(&tmpdir.path().join("ss2")).unwrap();
+        let ss2_reader = SSTableReader::new(&tmpdir.path().join("ss2")).unwrap();
         assert_eq!(ss2_reader.scan("", true)?.count(), 0); // only deleted entries, so should be empty.
 
+        let root_dir = &tmpdir.path().to_path_buf();
         let compactor = Compactor {
             db_config: &db_config,
-            root_dir: &tmpdir.path().to_path_buf(),
+            root_dir,
         };
         // compacting [ss1, ss2] should result in all numbers, since ss2 (with deleted entries) has lower precedence
-        let mut out_vec = compactor.compact(
-            &mut VecDeque::from([ss1_reader.try_clone()?, ss2_reader.try_clone()?]),
+        let out_vec = compactor.compact(
+            vec![ss1_reader.try_clone()?, ss2_reader.try_clone()?].into_iter(),
             0,
         )?;
         // small data size, so should be 1 sstable file
         assert_eq!(out_vec.len(), 1);
+        let sstable_filename = &out_vec[0].1;
         assert_eq!(
-            SSTableReader::new(&out_vec[0].1)?
+            SSTableReader::new(&root_dir.join(sstable_filename))?
                 .scan("", true)?
                 .map(|(k, _v)| k)
                 .collect::<Vec<_>>(),
@@ -279,11 +285,12 @@ mod test {
                 .collect::<Vec<_>>()
         );
         // but compacting the reverse, [ss2, ss1], should omit the deleted entries in ss2 since ss2 has precedence
-        out_vec = compactor.compact(&mut VecDeque::from([ss2_reader, ss1_reader]), 0)?;
+        let out_vec = compactor.compact(vec![ss2_reader, ss1_reader].into_iter(), 0)?;
         // small data size, so should be 1 sstable file
         assert_eq!(out_vec.len(), 1);
+        let sstable_filename = &out_vec[0].1;
         assert_eq!(
-            SSTableReader::new(&out_vec[0].1)?
+            SSTableReader::new(&root_dir.join(sstable_filename))?
                 .scan("", true)?
                 .map(|(k, _v)| k)
                 .collect::<Vec<_>>(),

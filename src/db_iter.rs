@@ -29,7 +29,7 @@ impl<'a> DBIteratorItemPeekable<'a> {
     }
 
     pub(crate) fn from_sstable(
-        reader: &'a mut SSTableReader,
+        reader: &SSTableReader,
         key_prefix: &str,
     ) -> Result<DBIteratorItemPeekable<'a>, SSTableError> {
         reader

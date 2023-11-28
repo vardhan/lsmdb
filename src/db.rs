@@ -68,12 +68,15 @@ pub struct DB {
     // Manifest describing where all the persistent data is.
     pub(crate) manifest: Manifest,
 
-    // Opened level-0 SSTable readers.
+    // Opened SSTable readers.
     // For now:
     // - All known sstables are opened.
     //
-    // First element is the newst sstable, the last is the oldest.
-    sstables_l0: VecDeque<SSTableReader>,
+    // level 0 is 0th element, etc.
+    // - level 0 is special, since sstables have overlapping keys.
+    // - First element is the newest sstable, the last is the oldest.
+    // level >= 1 have non-overlapping keys.
+    sstables: Vec<VecDeque<(KeyRange, SSTableReader)>>,
 
     // Active memtable, the latest source of data mutations
     active_memtable: Memtable,
@@ -101,12 +104,12 @@ pub struct DBConfig {
     pub max_frozen_memtables: usize,
     /// Size threshold for a block (counts all bytes in a block)
     pub block_max_size_bytes: usize,
-    /// The size (total bytes) level N can hold is [sstable_level_base_max_size_bytes]*10^(N)
+    /// The size (total bytes) level N can hold is [level_base_max_size_bytes]*10^(N)
     /// Once level N gets to this size, level N is compacted into level N+1.
-    pub sstable_level_base_max_size_bytes: u64,
-    /// The max # of sstable files for level N >= 1 is [compaction_level_base_max_shards]*2^(N-1)
-    /// Note that level 0's max # of sstables is defined by Self::max_frozen_memtables
-    pub compaction_level_base_max_shards: u64,
+    pub level_base_max_size_bytes: u64,
+    /// The max # of sstable files for level N is [level_base_max_shards]*2^(N)
+    /// This is used to compute the size of each sstable shard during compaction.
+    pub level_base_max_shards: u64,
 }
 
 impl Default for DBConfig {
@@ -116,9 +119,9 @@ impl Default for DBConfig {
             max_frozen_memtables: 1,
             block_max_size_bytes: 1024 * 4,
             // L0 = 10MB, L1 = 100mb, L2 = 1GB, L3 = 10GB ..
-            sstable_level_base_max_size_bytes: 1024 * 1024 * 10,
-            // L1 = 4 shards, L2 = 8, L3 = 16, ..)
-            compaction_level_base_max_shards: 4,
+            level_base_max_size_bytes: 1024 * 1024 * 10,
+            // L1 = 4 shards, L2 = 8, L3 = 16, ..
+            level_base_max_shards: 2,
         }
     }
 }
@@ -137,11 +140,11 @@ impl DB {
     pub fn open_with_config(root_dir: &Path, config: DBConfig) -> Result<DB, DBError> {
         let manifest = Manifest::open(&root_dir.to_path_buf())
             .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e)))?;
-        let sstables_l0 = Self::open_all_sstables(&manifest)?;
+        let sstables = Self::open_all_sstables(&manifest)?;
         Ok(DB {
             root_dir: root_dir.into(),
             manifest,
-            sstables_l0,
+            sstables,
             active_memtable: BTreeMap::new(),
             active_memtable_size: 0,
             frozen_memtables: VecDeque::<Memtable>::new(),
@@ -156,20 +159,25 @@ impl DB {
     // - The oldest SSTable is `0.sst`, the 2nd oldest is `1.sst`, and so on.
     // - The newest SSTable has the highest number.
     // - New SSTables are stored using the filename `<highest age so far + 1>.sst`.
-    fn open_all_sstables(manifest: &Manifest) -> Result<VecDeque<SSTableReader>, DBError> {
-        let mut readers = VecDeque::new();
-        for level in manifest.levels() {
-            for (_key_range, sstable_path) in level {
+    fn open_all_sstables(
+        manifest: &Manifest,
+    ) -> Result<Vec<VecDeque<(KeyRange, SSTableReader)>>, DBError> {
+        let mut levels = vec![];
+        for level in manifest.iter_levels() {
+            let mut readers = VecDeque::new();
+            for (key_range, sstable_path) in level {
                 let sstable_path = manifest.root_dir().join(sstable_path);
-                readers.push_front(SSTableReader::new(&sstable_path).map_err(|err| {
-                    DBError::SSTableOpen {
+                readers.push_front((
+                    key_range.clone(),
+                    SSTableReader::new(&sstable_path).map_err(|err| DBError::SSTableOpen {
                         sstable_path,
                         err: err.to_string(),
-                    }
-                })?);
+                    })?,
+                ));
             }
+            levels.push(readers);
         }
-        Ok(readers)
+        Ok(levels)
     }
 
     /// get() looks up the value of the given `key`.
@@ -190,13 +198,22 @@ impl DB {
             };
         }
 
-        // Not in the memtables?  Lets try the sstables
-        // Newest one first
-        for sstable in self.sstables_l0.iter_mut() {
-            match sstable.get(key) {
-                Ok(Some(EntryValue::Present(value))) => return Ok(Some(value)),
-                Ok(Some(EntryValue::Deleted)) => return Ok(None),
-                _ => continue,
+        // Not in the memtables?  Lets try each sstable level.
+        // try level 0, then 1, etc. For each level, look up the sstable shard it could be on.
+        for level_sstables in self.sstables.iter_mut() {
+            // TODO: look up the right sstable instead of checking every one.
+            for (range, sstable) in level_sstables.iter_mut() {
+                if key < &range.smallest || key > &range.largest {
+                    continue; // skip this sstable
+                }
+                match sstable
+                    .get(key)
+                    .map_err(|err| DBError::SSTable(err.to_string()))?
+                {
+                    Some(EntryValue::Present(value)) => return Ok(Some(value)),
+                    Some(EntryValue::Deleted) => return Ok(None),
+                    None => continue, // try the next level
+                };
             }
         }
 
@@ -235,17 +252,24 @@ impl DB {
                 }
 
                 // add the sstables
-                db_iters_peekable.append(
-                    &mut self
-                        .sstables_l0
-                        .iter_mut()
-                        // for sstable_reader in self.sstables {}
-                        .map(|sstable_reader| {
-                            DBIteratorItemPeekable::from_sstable(sstable_reader, key_prefix)
-                                .unwrap()
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                if !self.sstables.is_empty() {
+                    // scan through sstables in each level
+                    for level in &mut self.sstables {
+                        db_iters_peekable.append(
+                            &mut level
+                                .iter_mut()
+                                // for sstable_reader in self.sstables {}
+                                .map(|sstable_reader| {
+                                    DBIteratorItemPeekable::from_sstable(
+                                        &sstable_reader.1,
+                                        key_prefix,
+                                    )
+                                    .unwrap()
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
 
                 let mut heap = BinaryHeap::new();
                 let mut iter_precedence = 0; // 0 means newest
@@ -284,6 +308,7 @@ impl DB {
             self.freeze_active_memtable()
                 .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
         }
+        // Is it time to compact level 0 -> level 1?
         if self.frozen_memtables.len() > self.config.max_frozen_memtables {
             self.flush_frozen_memtables_to_sstable()
                 .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
@@ -294,33 +319,85 @@ impl DB {
                     ss_err
                 ))
             })?;
-            if l0_size > self.config.sstable_level_base_max_size_bytes {
-                Compactor {
+            if l0_size > self.config.level_base_max_size_bytes {
+                // Initialize L1 if it doesn't exist.
+                if self.sstables.len() == 1 {
+                    self.sstables.push(VecDeque::new());
+                }
+                let sstables_out = Compactor {
                     root_dir: &self.root_dir,
                     db_config: &self.config,
                 }
-                .compact(&mut self.sstables_l0, 0)
+                .compact(
+                    self.sstables[0]
+                        .iter()
+                        .chain(self.sstables[1].iter())
+                        .map(|(_range, reader)| reader.try_clone().unwrap()),
+                    0,
+                )
                 .unwrap(); // panic if compaction fails; FIXME: fail more gracefully?
+
+                // save the new merged files
+                self.manifest
+                    .merge_level(sstables_out, 1)
+                    .map_err(|manifest_err| DBError::ManifestError(manifest_err.to_string()))?;
+
+                self.open_level_from_manifest(0)
+                    .map_err(|err| DBError::SSTable(err.to_string()))?;
+                self.open_level_from_manifest(1)
+                    .map_err(|err| DBError::SSTable(err.to_string()))?;
             }
         }
         Ok(())
     }
 
+    fn open_level_from_manifest(&mut self, level: usize) -> Result<(), SSTableError> {
+        debug_assert!(level <= self.sstables.len());
+
+        let sstables = self
+            .manifest
+            .iter_level_files(level)
+            .map(
+                |(key_range, path)| -> Result<(KeyRange, SSTableReader), SSTableError> {
+                    Ok((key_range.clone(), SSTableReader::new(&path.clone().into())?))
+                },
+            )
+            .collect::<Result<VecDeque<_>, _>>()?;
+
+        if level == self.sstables.len() {
+            self.sstables.push(sstables);
+        } else {
+            self.sstables[level] = sstables;
+        }
+
+        Ok(())
+    }
+
     fn compute_level_size(&self, level: u32) -> Result<u64, SSTableError> {
         assert!(level == 0, "only level 0 compaction is supported");
-        self.sstables_l0.iter().map(|reader| reader.size()).sum()
+        self.sstables[level as usize]
+            .iter()
+            .map(|(_range, reader)| reader.size())
+            .sum()
     }
 
     pub(crate) fn freeze_active_memtable(&mut self) -> Result<(), SSTableError> {
         self.frozen_memtables
             .push_front(std::mem::take(&mut self.active_memtable));
+        self.active_memtable_size = 0;
         Ok(())
     }
 
+    /// Flushes the set of frozen memtables into a set of L0 sstables.
+    ///
+    /// Does not do any compaction.
     pub(crate) fn flush_frozen_memtables_to_sstable(&mut self) -> Result<(), SSTableError> {
+        if self.sstables.is_empty() {
+            self.sstables.push(VecDeque::new());
+        }
         // flush the oldest frozen memtable first, and the newest one last.
         for frozen_memtable in self.frozen_memtables.iter().rev() {
-            let sstable_filename: String = format!("l0-{}.sst", self.sstables_l0.len());
+            let sstable_filename: String = format!("l0-{}.sst", self.sstables[0].len());
             let sstable_path = self.root_dir.join(&sstable_filename);
 
             // flush the frozen memtable to sstable
@@ -334,22 +411,29 @@ impl DB {
             sstable_file.sync_all()?;
             std::mem::drop(sstable_file);
 
-            self.sstables_l0
-                .push_front(SSTableReader::new(&sstable_path)?);
             match (
                 frozen_memtable.first_key_value(),
                 frozen_memtable.last_key_value(),
             ) {
-                (Some((first_key, _)), Some((last_key, _))) => self
-                    .manifest
-                    .add_sstable(
-                        sstable_filename,
+                (Some((smallest, _)), Some((largest, _))) => {
+                    let (range, reader) = (
                         KeyRange {
-                            smallest: first_key.clone(),
-                            largest: last_key.clone(),
+                            smallest: smallest.to_string(),
+                            largest: largest.to_string(),
                         },
-                    )
-                    .map_err(|e| SSTableError::ManifestError(e.to_string()))?,
+                        SSTableReader::new(&sstable_path)?,
+                    );
+                    self.sstables[0].push_front((range, reader));
+                    self.manifest
+                        .add_sstable_l0(
+                            sstable_filename,
+                            KeyRange {
+                                smallest: smallest.clone(),
+                                largest: largest.clone(),
+                            },
+                        )
+                        .map_err(|e| SSTableError::ManifestError(e.to_string()))?;
+                }
                 _ => {
                     return Err(SSTableError::Custom(
                         "Frozen memtable has no elements to flush",
@@ -365,17 +449,20 @@ impl DB {
     }
 
     // for testing.
-    pub(crate) fn get_sstables_mut(&mut self) -> &mut VecDeque<SSTableReader> {
-        &mut self.sstables_l0
+    pub(crate) fn get_sstables_mut(&mut self) -> &mut VecDeque<(KeyRange, SSTableReader)> {
+        &mut self.sstables[0]
     }
 }
 
 #[cfg(test)]
 mod test {
 
+    use std::{clone, collections::HashMap};
+
     use super::*;
     use anyhow;
     use pretty_assertions::assert_eq;
+    use rand::Rng;
 
     #[test]
     fn basic_put_get() {
@@ -567,7 +654,7 @@ mod test {
         db.flush_frozen_memtables_to_sstable()
             .expect("couldnt flush frozen memtables");
 
-        assert_eq!(db.sstables_l0.len(), keys.len());
+        assert_eq!(db.sstables[0].len(), keys.len());
 
         // sstables should now be persisted -- test that they are accessible when db is re-opened
         std::mem::drop(db);
@@ -580,12 +667,13 @@ mod test {
             },
         )
         .expect("couldnt reopen db");
-        assert_eq!(db.sstables_l0.len(), keys.len());
+        assert_eq!(db.sstables[0].len(), keys.len());
 
         // check that each sstable has the correct key, and doesn't have any of the other keys.
         for (i, key) in keys.iter().rev().enumerate() {
             assert_eq!(
-                db.sstables_l0[i]
+                db.sstables[0][i]
+                    .1
                     .get(format!("/key/{}", key).as_str())
                     .unwrap_or_else(|_| panic!("couldnt get /key/{}", key)),
                 Some(EntryValue::Present(format!("val {}", key).into_bytes()))
@@ -595,7 +683,8 @@ mod test {
                     continue;
                 }
                 assert_eq!(
-                    db.sstables_l0[i]
+                    db.sstables[0][i]
+                        .1
                         .get(format!("/key/{}", non_present_key).as_str())
                         .unwrap_or_else(|_| panic!("couldnt get /key/{}", non_present_key)),
                     None
@@ -623,21 +712,33 @@ mod test {
         db.put("/key/3", "sstable0".as_bytes())?;
         db.put("/key/4", "sstable0".as_bytes())?; // should be replaced by sstable1
         db.freeze_active_memtable()?;
+        assert_eq!(db.active_memtable_size, 0);
+        assert_eq!(db.frozen_memtables.len(), 1);
         db.flush_frozen_memtables_to_sstable()?;
+        assert_eq!(db.frozen_memtables.len(), 0);
+        assert_eq!(db.sstables.len(), 1); // just L0
+        assert_eq!(db.sstables[0].len(), 1); // just 1 sstable in L0
 
-        db.delete("/key/1")?; // should replace sstable0, and be replaced by frozen memtable
+        db.delete("/key/1")?; // should replace the version in sstable-L0-0, and be replaced by active memtable
         db.put("/key/2", "sstable1".as_bytes())?;
-        db.put("/key/4", "sstable1".as_bytes())?; // should replace sstable0
+        db.put("/key/4", "sstable1".as_bytes())?; // should replace sstable-L0-0
         db.put("/aa/insstable2", "garbage".as_bytes())?;
         db.put("/zz/insstable2", "garbage".as_bytes())?;
         db.freeze_active_memtable()?;
+        assert_eq!(db.active_memtable_size, 0);
+        assert_eq!(db.frozen_memtables.len(), 1);
         db.flush_frozen_memtables_to_sstable()?;
+        assert_eq!(db.frozen_memtables.len(), 0);
+        assert_eq!(db.sstables.len(), 1); // just L0
+        assert_eq!(db.sstables[0].len(), 2); // now we have 2 sstables in L0
 
         db.put("/aa/infrozen", "garbage".as_bytes())?;
         db.put("/zz/infrozen", "garbage".as_bytes())?;
         db.put("/key/1", "frozen".as_bytes())?;
         db.put("/key/5", "frozen".as_bytes())?;
         db.freeze_active_memtable()?;
+        assert_eq!(db.active_memtable_size, 0);
+        assert_eq!(db.frozen_memtables.len(), 1);
 
         db.put("/key/0", "active".as_bytes())?;
         db.put("/key/6", "active".as_bytes())?;
@@ -647,7 +748,7 @@ mod test {
 
         assert_eq!(db.frozen_memtables.len(), 1);
         assert_eq!(db.frozen_memtables[0].len(), 4);
-        assert_eq!(db.sstables_l0.len(), 2);
+        assert_eq!(db.sstables[0].len(), 2);
 
         assert_eq!(db.get("/key/3")?, Some("sstable0".into()));
         assert_eq!(db.get("/key/2")?, Some("sstable1".into()));
@@ -673,6 +774,74 @@ mod test {
                 ("/key/5".to_string(), b"frozen".to_vec()),
                 ("/key/6".to_string(), b"active".to_vec()),
             ]
+        );
+
+        Ok(())
+    }
+
+    // Test get(), put(), delete() and seek().
+    #[test]
+    fn basic_across_levels() -> anyhow::Result<()> {
+        let tmpdir = tempdir::TempDir::new("lsmdb")?;
+        let mut db = DB::open_with_config(
+            tmpdir.path(),
+            DBConfig {
+                memtable_max_size_bytes: 1024 * 1, // 1KB per memtable / L0 sstable
+                max_frozen_memtables: 2, // 2 frozen memtables before flushing to 1 sstable
+                level_base_max_shards: 2, // 2**2 = 4 shards on level 1
+                level_base_max_size_bytes: 1024 * 6, // 6KB for level 0, 60KB for level 1.
+                ..DBConfig::default()
+            },
+        )?;
+
+        // put enough keys to generate 2 levels, where the 2nd level has atleast 3 shards.
+        // Keep putting in random KVs until we have 3 levels:
+        let mut rng = rand::thread_rng();
+        let mut expected = HashMap::new();
+        while db.sstables.len() < 2 || db.sstables[1].len() < 3 {
+            let num = rng.gen::<u32>().to_string();
+            let key = format!("/key/{}", num);
+            let val = format!("val {}", num).as_bytes().to_vec();
+            db.put(key.clone(), val.clone())?;
+            expected.insert(key, val);
+        }
+
+        // Now delete 30% of the keys (IDK why 50%)
+        let keys_to_delete = expected
+            .iter()
+            .filter(|_| rng.gen_ratio(5, 10))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in &keys_to_delete {
+            db.delete(key)?;
+            expected.remove(key);
+        }
+
+        // Now ensure scan() is able to accurately scan() the expected keys.
+        let actual = db
+            .scan("")?
+            .into_iter()
+            .collect::<HashMap<String, Vec<u8>>>();
+        assert_eq!(expected, actual);
+
+        // Make sure we can get() the existing keys.
+        assert_eq!(
+            expected
+                .iter()
+                .map(|(key, val)| db.get(key).unwrap() == Some(val.clone()))
+                .filter(|found| *found)
+                .count(),
+            expected.len()
+        );
+
+        // Make sure we cannot get() the deleted keys.
+        assert_eq!(
+            keys_to_delete
+                .iter()
+                .map(|key| db.get(key).unwrap().is_some())
+                .filter(|found| *found)
+                .count(),
+            0
         );
 
         Ok(())
