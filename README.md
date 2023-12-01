@@ -1,5 +1,5 @@
 # lsmdb
-[![lsmdb](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml/badge.svg)](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml) [![Coverage Status](https://coveralls.io/repos/github/vardhan/lsmdb/badge.svg?branch=main)](https://coveralls.io/github/vardhan/lsmdb?branch=main)
+[![lsmdb](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml/badge.svg)](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml) [![Coverage Status](https://coveralls.io/repos/github/vardhan/lsmdb/badge.svg?branch=main&kill_cache=1)](https://coveralls.io/github/vardhan/lsmdb?branch=main)
 
 A toy log structured merge tree database.
 
