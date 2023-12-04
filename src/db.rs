@@ -1,4 +1,7 @@
-use crate::db_iter::{DBIterator, DBIteratorItem, DBIteratorItemPeekable};
+use crate::db_config::*;
+use crate::db_iter::{
+    KeyEValueIterator, KeyEValueIteratorItem, KeyEValueIteratorItemPeekable, KeyValueIterator,
+};
 
 mod compaction;
 mod manifest;
@@ -96,36 +99,6 @@ pub struct DB {
     config: DBConfig,
 }
 
-/// The configuration used when opening a database with [DB::open_with_config].
-pub struct DBConfig {
-    /// Size threshold for a memtable (counts key & value sizes)
-    pub memtable_max_size_bytes: usize,
-    /// Max number of frozen memtables before they are force-flushed to sstable
-    pub max_frozen_memtables: usize,
-    /// Size threshold for a block (counts all bytes in a block)
-    pub block_max_size_bytes: usize,
-    /// The size (total bytes) level N can hold is [level_base_max_size_bytes]*10^(N)
-    /// Once level N gets to this size, level N is compacted into level N+1.
-    pub level_base_max_size_bytes: u64,
-    /// The max # of sstable files for level N is [level_base_max_shards]*2^(N)
-    /// This is used to compute the size of each sstable shard during compaction.
-    pub level_base_max_shards: u64,
-}
-
-impl Default for DBConfig {
-    fn default() -> Self {
-        DBConfig {
-            memtable_max_size_bytes: 1024 * 1024, // 1 MB
-            max_frozen_memtables: 1,
-            block_max_size_bytes: 1024 * 4,
-            // L0 = 10MB, L1 = 100mb, L2 = 1GB, L3 = 10GB ..
-            level_base_max_size_bytes: 1024 * 1024 * 10,
-            // L1 = 4 shards, L2 = 8, L3 = 16, ..
-            level_base_max_shards: 2,
-        }
-    }
-}
-
 impl DB {
     /// Opens the database at `root_path` using default configuration, and creates one if it doesn't exist.
     ///
@@ -201,10 +174,10 @@ impl DB {
         // Not in the memtables?  Lets try each sstable level.
         // try level 0, then 1, etc. For each level, look up the sstable shard it could be on.
         for level_sstables in self.sstables.iter_mut() {
-            // TODO: look up the right sstable instead of checking every one.
+            // TODO: consult the manifest and look up the right sstable instead of checking every one.
             for (range, sstable) in level_sstables.iter_mut() {
                 if key < &range.smallest || key > &range.largest {
-                    continue; // skip this sstable
+                    continue; // skip this sstable since it won't have the key
                 }
                 match sstable
                     .get(key)
@@ -233,54 +206,55 @@ impl DB {
     /// scan() returns an iterator of all key-value pairs whose key begins with given `key_prefix`.
     ///
     /// The iterator items are in ordered by key, in ascending order.
-    pub fn scan(&mut self, key_prefix: &str) -> Result<DBIterator, DBError> {
+    pub fn scan(&mut self, key_prefix: &str) -> Result<KeyValueIterator, DBError> {
         // make a min-heap of peekable iterators, where the heap key is:
         // (peekable iterator, precedent)
-        Ok(DBIterator {
-            // most recent memtable is first
-            iterators: {
+        let iter = KeyEValueIterator {
+            key_prefix: key_prefix.to_string(),
+            should_skip_deleted: true,
+            heap_of_iterators: {
                 // (next element, rest of iterator)
-                let mut db_iters_peekable = Vec::<DBIteratorItemPeekable>::new();
+                let mut db_iters_peekable = Vec::<KeyEValueIteratorItemPeekable>::new();
 
                 // add the active memtable, and then the frozen memtables
                 for memtable in [&self.active_memtable]
                     .into_iter()
                     .chain(self.frozen_memtables.iter())
                 {
-                    db_iters_peekable
-                        .push(DBIteratorItemPeekable::from_memtable(memtable, key_prefix));
+                    db_iters_peekable.push(KeyEValueIteratorItemPeekable::from_memtable(
+                        memtable, key_prefix,
+                    ));
                 }
 
-                // add the sstables
-                if !self.sstables.is_empty() {
-                    // scan through sstables in each level
-                    for level in &mut self.sstables {
-                        db_iters_peekable.append(
-                            &mut level
-                                .iter_mut()
-                                // for sstable_reader in self.sstables {}
-                                .map(|sstable_reader| {
-                                    DBIteratorItemPeekable::from_sstable(
-                                        &sstable_reader.1,
-                                        key_prefix,
-                                    )
-                                    .unwrap()
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                    }
+                // add every sstable across every level
+                // TODO: consult the manifest and only include sstables which contain the key prefix.
+                for level in &mut self.sstables {
+                    db_iters_peekable.append(
+                        &mut level
+                            .iter_mut()
+                            // for sstable_reader in self.sstables {}
+                            .map(|sstable_reader| {
+                                KeyEValueIteratorItemPeekable::from_sstable(
+                                    &sstable_reader.1,
+                                    key_prefix,
+                                )
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>(),
+                    );
                 }
 
                 let mut heap = BinaryHeap::new();
                 let mut iter_precedence = 0; // 0 means newest
                 for db_iter in db_iters_peekable.into_iter() {
-                    heap.push(Reverse(DBIteratorItem(db_iter, iter_precedence)));
+                    heap.push(Reverse(KeyEValueIteratorItem(db_iter, iter_precedence)));
                     iter_precedence += 1;
                 }
                 heap
             },
-            key_prefix: key_prefix.to_string(),
-        })
+        };
+
+        Ok(KeyValueIterator { iter })
     }
 
     fn get_from_memtable(
@@ -304,55 +278,67 @@ impl DB {
                 self.active_memtable_size += value_len;
             }
         }
-        if self.active_memtable_size >= self.config.memtable_max_size_bytes {
+        if self.active_memtable_size >= self.config.max_active_memtable_size {
             self.freeze_active_memtable()
                 .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
         }
-        // Is it time to compact level 0 -> level 1?
+        // Is it time to compact memtables into L0?
         if self.frozen_memtables.len() > self.config.max_frozen_memtables {
             self.flush_frozen_memtables_to_sstable()
                 .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
 
-            let l0_size = self.compute_level_size(0).map_err(|ss_err| {
+            // is L0 too big?
+            self.compact_if_l0_full()?;
+        }
+        Ok(())
+    }
+
+    // If L0 is full, starts the compaction process which compacts each level into the next if its too big.
+    fn compact_if_l0_full(&mut self) -> Result<(), DBError> {
+        for level in 0..self.sstables.len() {
+            let level_size = self.compute_level_size(level as u32).map_err(|ss_err| {
                 DBError::SSTable(format!(
-                    "Could not compute size of level 0 sstables: {}",
-                    ss_err
+                    "Could not compute size of level {} sstables: {}",
+                    level, ss_err
                 ))
             })?;
-            if l0_size > self.config.level_base_max_size_bytes {
-                // Initialize L1 if it doesn't exist.
-                if self.sstables.len() == 1 {
-                    self.sstables.push(VecDeque::new());
-                }
-                let sstables_out = Compactor {
-                    root_dir: &self.root_dir,
-                    db_config: &self.config,
-                }
-                .compact(
-                    self.sstables[0]
-                        .iter()
-                        .chain(self.sstables[1].iter())
-                        .map(|(_range, reader)| reader.try_clone().unwrap()),
-                    0,
-                )
-                .unwrap(); // panic if compaction fails; FIXME: fail more gracefully?
-
-                // save the new merged files
-                self.manifest
-                    .merge_level(sstables_out, 1)
-                    .map_err(|manifest_err| DBError::ManifestError(manifest_err.to_string()))?;
-
-                self.open_level_from_manifest(0)
-                    .map_err(|err| DBError::SSTable(err.to_string()))?;
-                self.open_level_from_manifest(1)
-                    .map_err(|err| DBError::SSTable(err.to_string()))?;
+            if level_size <= self.config.level_max_size(level as u32) {
+                return Ok(());
             }
+            // 1. Initialize the next level if it doesn't exist.
+            if self.sstables.len() == level + 1 {
+                self.sstables.push(VecDeque::new());
+            }
+
+            // 2. Compact level into level+1
+            let sstables_out = Compactor {
+                root_dir: &self.root_dir,
+                db_config: &self.config,
+            }
+            .compact(
+                self.sstables[level]
+                    .iter()
+                    .chain(self.sstables[level + 1].iter())
+                    .map(|(_range, reader)| reader.try_clone().unwrap()),
+                level as u32,
+            )
+            .unwrap(); // panic if compaction fails; TODO: should we fail more gracefully?
+
+            // 3. Save the new level+1's files and empty out the previous level.
+            self.manifest
+                .merge_level(sstables_out, level + 1)
+                .map_err(|manifest_err| DBError::ManifestError(manifest_err.to_string()))?;
+
+            self.open_level_from_manifest(level)
+                .map_err(|err| DBError::SSTable(err.to_string()))?;
+            self.open_level_from_manifest(level + 1)
+                .map_err(|err| DBError::SSTable(err.to_string()))?;
         }
         Ok(())
     }
 
     fn open_level_from_manifest(&mut self, level: usize) -> Result<(), SSTableError> {
-        debug_assert!(level <= self.sstables.len());
+        debug_assert!(level < self.sstables.len());
 
         let sstables = self
             .manifest
@@ -374,7 +360,6 @@ impl DB {
     }
 
     fn compute_level_size(&self, level: u32) -> Result<u64, SSTableError> {
-        assert!(level == 0, "only level 0 compaction is supported");
         self.sstables[level as usize]
             .iter()
             .map(|(_range, reader)| reader.size())
@@ -447,17 +432,12 @@ impl DB {
 
         Ok(())
     }
-
-    // for testing.
-    pub(crate) fn get_sstables_mut(&mut self) -> &mut VecDeque<(KeyRange, SSTableReader)> {
-        &mut self.sstables[0]
-    }
 }
 
 #[cfg(test)]
 mod test {
 
-    use std::{clone, collections::HashMap};
+    use std::collections::HashMap;
 
     use super::*;
     use anyhow;
@@ -466,7 +446,8 @@ mod test {
 
     #[test]
     fn basic_put_get() {
-        let mut db = DB::open(Path::new("/tmp/hello")).expect("failed to open");
+        let tmpdir = tempdir::TempDir::new("lsmdb").unwrap();
+        let mut db = DB::open(tmpdir.path()).expect("failed to open");
 
         db.put("1", "hello").expect("cant put 1");
         db.put("2", "world").expect("cant put 2");
@@ -478,7 +459,8 @@ mod test {
 
     #[test]
     fn basic_delete() {
-        let mut db = DB::open(Path::new("/tmp/hello")).expect("failed to open");
+        let tmpdir = tempdir::TempDir::new("lsmdb").unwrap();
+        let mut db = DB::open(tmpdir.path()).expect("failed to open");
 
         db.put("1", "hello").expect("cant put 1");
         db.put("2", "world").expect("cant put 2");
@@ -491,7 +473,8 @@ mod test {
 
     #[test]
     fn basic_scan() {
-        let mut db = DB::open(Path::new("/tmp/hello")).expect("failed to open");
+        let tmpdir = tempdir::TempDir::new("lsmdb").unwrap();
+        let mut db = DB::open(tmpdir.path()).expect("failed to open");
 
         db.put("/user/name/adam", "adam")
             .expect("cant put /user/adam");
@@ -779,26 +762,25 @@ mod test {
         Ok(())
     }
 
-    // Test get(), put(), delete() and seek().
+    // Test get(), put(), delete() and scan() across levels.
     #[test]
     fn basic_across_levels() -> anyhow::Result<()> {
         let tmpdir = tempdir::TempDir::new("lsmdb")?;
         let mut db = DB::open_with_config(
             tmpdir.path(),
             DBConfig {
-                memtable_max_size_bytes: 1024 * 1, // 1KB per memtable / L0 sstable
-                max_frozen_memtables: 2, // 2 frozen memtables before flushing to 1 sstable
-                level_base_max_shards: 2, // 2**2 = 4 shards on level 1
-                level_base_max_size_bytes: 1024 * 6, // 6KB for level 0, 60KB for level 1.
+                max_active_memtable_size: 512, // 512 bytes per memtable / L0 sstable
+                max_frozen_memtables: 2,       // 2 frozen memtables before flushing sstable
+                level_base_max_sstables: 1,    // 2**1 = 2 shards on level 0
+                level_base_max_size: 1024, // 1KB for level 0, 10KB for level 1, 100KB level 2, ~1MB level 3, ..
                 ..DBConfig::default()
             },
         )?;
 
-        // put enough keys to generate 2 levels, where the 2nd level has atleast 3 shards.
-        // Keep putting in random KVs until we have 3 levels:
+        // put() enough keys to generate 3 levels (L0, L1, L2)
         let mut rng = rand::thread_rng();
         let mut expected = HashMap::new();
-        while db.sstables.len() < 2 || db.sstables[1].len() < 3 {
+        while db.sstables.len() < 4 || db.sstables[2].len() < 2 {
             let num = rng.gen::<u32>().to_string();
             let key = format!("/key/{}", num);
             let val = format!("val {}", num).as_bytes().to_vec();
@@ -806,7 +788,11 @@ mod test {
             expected.insert(key, val);
         }
 
-        // Now delete 30% of the keys (IDK why 50%)
+        // Now ensure scan() is able to accurately scan() the expected keys.
+        let actual = db.scan("")?.collect::<HashMap<String, Vec<u8>>>();
+        assert_eq!(expected, actual);
+
+        // Now delete ~50% of the keys
         let keys_to_delete = expected
             .iter()
             .filter(|_| rng.gen_ratio(5, 10))
@@ -816,13 +802,6 @@ mod test {
             db.delete(key)?;
             expected.remove(key);
         }
-
-        // Now ensure scan() is able to accurately scan() the expected keys.
-        let actual = db
-            .scan("")?
-            .into_iter()
-            .collect::<HashMap<String, Vec<u8>>>();
-        assert_eq!(expected, actual);
 
         // Make sure we can get() the existing keys.
         assert_eq!(
@@ -838,11 +817,14 @@ mod test {
         assert_eq!(
             keys_to_delete
                 .iter()
-                .map(|key| db.get(key).unwrap().is_some())
-                .filter(|found| *found)
+                .filter(|key| db.get(key).unwrap().is_some())
                 .count(),
             0
         );
+
+        // Now ensure scan() is able to accurately scan() the expected keys.
+        let actual = db.scan("")?.collect::<HashMap<String, Vec<u8>>>();
+        assert_eq!(expected, actual);
 
         Ok(())
     }

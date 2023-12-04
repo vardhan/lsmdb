@@ -22,8 +22,8 @@ use super::reader_ext::ReaderExt;
 // Some additional context:
 // - All numbers are encoded in little-endian (LE)
 // - Strings (keys) are encoded as # of bytes (LE), followed by bytes.
-// - Blocks are sorted by their keyspan.
-// - Entries in a block are sorted in ascending order, by key.
+// - Blocks are sorted by their key range.
+// - Entries within a block are sorted by key, in ascending order.
 //
 // SSTable Encoding:
 // ---------------------------------------
@@ -347,6 +347,7 @@ impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn write_to_sstable<'kv>(
     kv_iter: impl Iterator<Item=&'kv (Key, EntryValue)>,
     writer: &mut impl Write,
@@ -433,7 +434,7 @@ impl<'c> BlockWriter<'c> {
             }
             + size_of::<u32>() // byte offset for block footer
             ;
-        if self.size() + entry_size > self.db_config.block_max_size_bytes {
+        if self.size() + entry_size > self.db_config.block_max_size {
             return Err(SSTableError::BlockSizeOverflow);
         }
         self.block_data.write_all(&(key_len as u32).to_le_bytes())?;
@@ -632,8 +633,11 @@ impl<'k, 'r, R: Read + Seek + 'r> Iterator for BlockIterator<'k, 'r, R> {
 #[cfg(test)]
 mod test {
     use crate::db::{DBConfig, DB, sstable::{SSTableError, SSTableReader, BlockReader, BlockWriter}, EntryValue};
-    use std::io::Cursor;
+    use std::{io::Cursor, fs::File, collections::HashMap};
+    use rand::Rng;
     use tempdir::TempDir;
+
+    use super::SSTableWriter;
 
     #[test]
     fn block_writer_one_entry() -> anyhow::Result<()> {
@@ -709,7 +713,7 @@ mod test {
                 )
                 .expect("failed to put");
         }
-        assert!(writer.size() < db_config.block_max_size_bytes);
+        assert!(writer.size() < db_config.block_max_size);
         assert!(matches!(
             writer.push(
                 "/user/username_30495",
@@ -728,7 +732,7 @@ mod test {
             DBConfig {
                 // don't auto-write to sstable; this test triggers that manually
                 max_frozen_memtables: 4,
-                block_max_size_bytes: num_entries, // this should force multiple blocks to be written
+                block_max_size: num_entries, // this should force multiple blocks to be written
                 ..DBConfig::default()
             },
         )
@@ -750,7 +754,7 @@ mod test {
         db.freeze_active_memtable().unwrap();
         db.flush_frozen_memtables_to_sstable().unwrap();
 
-        let sstables = db.get_sstables_mut();
+        let sstables = &db.sstables[0];
         assert!(sstables.len() == 1);
         assert!(sstables[0].1.block_index.len() > 1); // there should be multiple blocks
 
@@ -827,5 +831,52 @@ mod test {
             // Try to get a missing key which would be before the first key in the sstable
             assert_eq!(sstable.get("/user/a").expect("couldnt get unknown"), None);
         }
+    }
+
+    #[test]
+    fn large_sstable_read_write() -> anyhow::Result<()> {
+        let tempdir = TempDir::new("lsmdb_test").expect("couldnt make a temp dir");
+        let db_config = DBConfig {
+            // don't auto-write to sstable; this test triggers that manually
+            max_frozen_memtables: 4,
+            ..DBConfig::default()
+        };
+
+        let sstable_path = tempdir.path().join("dummy_sstable");
+        let mut sstable_file = File::create(sstable_path.clone())?;
+
+        let mut ss_writer = SSTableWriter::new(&mut sstable_file, &db_config);
+
+        // write 20k keys into sstable, half of them deleted.
+        let mut expected = HashMap::new();
+        let mut rng = rand::thread_rng();
+        let key_range = 0..20000;
+        for i in key_range.clone() {
+            let key = format!("/key/{:0>5}", i);
+            let val = if rng.gen_ratio(5, 10) {
+                EntryValue::Present(format!("val {}", i).as_bytes().to_vec())
+            } else {
+                EntryValue::Deleted
+            };
+            ss_writer.push(&key, &val)?;
+            expected.insert(key, val);
+        };
+
+        ss_writer.flush()?;
+
+        // read it back
+        let mut ss_reader = SSTableReader::new(&sstable_path).unwrap();
+        assert_eq!(expected, ss_reader.scan("", false)?.collect());
+
+        let deleted_actual: HashMap<&String,&EntryValue> = expected.iter().filter(|&(_key,val)| val != &EntryValue::Deleted).collect();
+        assert_eq!(deleted_actual, ss_reader.scan("", true)?.collect::<HashMap<String,EntryValue>>().iter().collect());
+
+        // pick 500 random keys to read. some should've been deleted, some should exist.
+        for _i in 0..500 {
+            let key = format!("/key/{:0>5}", rng.gen_range(key_range.clone()));
+            assert_eq!(expected[&key], ss_reader.get(&key).unwrap().unwrap());
+        }
+
+        Ok(())
     }
 }

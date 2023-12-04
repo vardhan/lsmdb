@@ -3,7 +3,10 @@ use std::{cmp::Reverse, path::PathBuf};
 use crate::{
     db::manifest::KeyRange,
     db::sstable::SSTableReader,
-    db_iter::{DBIterator, DBIteratorItem, DBIteratorItemPeekable, DBIteratorItemPrecedence},
+    db_iter::{
+        DBIteratorItemPrecedence, KeyEValueIterator, KeyEValueIteratorItem,
+        KeyEValueIteratorItemPeekable,
+    },
 };
 
 use super::{
@@ -37,21 +40,19 @@ impl<'p, 'c> Compactor<'p, 'c> {
     ) -> Result<Vec<(KeyRange, String)>, SSTableError> {
         // make a DBIterator out of `sstables_in`.
         let iterators = sstables_in
-            .map(|reader| DBIteratorItemPeekable::from_sstable(&reader, "").unwrap())
+            .map(|reader| KeyEValueIteratorItemPeekable::from_sstable(&reader, "").unwrap())
             .enumerate()
             .map(|(precedence, iter)| {
-                Reverse(DBIteratorItem(iter, precedence as DBIteratorItemPrecedence))
+                Reverse(KeyEValueIteratorItem(
+                    iter,
+                    precedence as DBIteratorItemPrecedence,
+                ))
             })
             .collect();
-        let iter = DBIterator {
-            iterators,
-            key_prefix: "".to_string(),
-        };
 
-        // compute the max size an sstable shard for (level+1) can be
-        let level_max_bytes = self.db_config.level_base_max_size_bytes * 10_u64.pow(level_in + 1);
-        let level_max_shards = self.db_config.level_base_max_shards * 2_u64.pow(level_in + 1);
-        let shard_max_bytes = level_max_bytes / level_max_shards;
+        // compute the max size an sstable for (level+1) can be
+        let sstable_max_bytes = self.db_config.level_max_size(level_in + 1)
+            / self.db_config.level_max_sstables(level_in + 1);
 
         let mut sstables_out: Vec<(KeyRange, String)> = Vec::new();
 
@@ -59,10 +60,20 @@ impl<'p, 'c> Compactor<'p, 'c> {
             make_new_sstable_file(self.root_dir, level_in)?;
         let mut cur_sstable_writer: SSTableWriter<'_, '_, std::fs::File> =
             SSTableWriter::new(&mut cur_sstable_file, self.db_config);
-        let (mut first_key, mut last_key) = (None, None);
 
+        let (mut first_key, mut last_key) = (None, None);
+        let iter = KeyEValueIterator {
+            heap_of_iterators: iterators,
+            key_prefix: "".to_string(),
+            should_skip_deleted: false,
+        };
         for (key, value) in iter {
-            if (cur_sstable_writer.size() as u64) > shard_max_bytes {
+            cur_sstable_writer.push(&key, &value)?;
+            if first_key.is_none() {
+                first_key = Some(key.clone());
+            }
+            last_key = Some(key);
+            if (cur_sstable_writer.size() as u64) > sstable_max_bytes {
                 // flush current sstable and rotate a new one
                 cur_sstable_writer.flush()?;
                 sstables_out.push((
@@ -78,11 +89,6 @@ impl<'p, 'c> Compactor<'p, 'c> {
                     make_new_sstable_file(self.root_dir, level_in)?;
                 cur_sstable_writer = SSTableWriter::new(&mut cur_sstable_file, self.db_config);
             }
-            cur_sstable_writer.push(&key, &super::EntryValue::Present(value))?;
-            if first_key.is_none() {
-                first_key = Some(key.clone());
-            }
-            last_key = Some(key);
         }
 
         // flush final sstable if it isn't empty
@@ -93,7 +99,7 @@ impl<'p, 'c> Compactor<'p, 'c> {
                     smallest: first_key.unwrap(),
                     largest: last_key.unwrap(),
                 },
-                // FIXME: replace unwrap() with an error.
+                // TODO: replace unwrap() with an error.
                 cur_sstable_pathbuf.to_str().unwrap().to_string(),
             ));
         }
@@ -107,17 +113,18 @@ pub fn make_new_sstable_file(
     level: u32,
 ) -> std::io::Result<(std::fs::File, PathBuf)> {
     let mut i = 0;
-    let mut candidate = root_dir.join(format!("l{level}-{i}.sst"));
-    while candidate.exists() {
+    loop {
+        let candidate = root_dir.join(format!("l{level}-{i}.sst"));
+        if !candidate.exists() {
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(candidate.clone())?;
+            return Ok((file, candidate));
+        }
         i += 1;
-        candidate = root_dir.join(format!("l{level}-{i}.sst"));
     }
-    let file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(candidate.clone())?;
-    Ok((file, candidate))
 }
 
 #[cfg(test)]
@@ -132,12 +139,14 @@ mod test {
     use pretty_assertions::assert_eq;
     use tempdir::TempDir;
 
-    // Generates a list of (sstable file, number of keys in the file), where each sstable file has almost a max amount of keys.
+    // Generates a list of (sstable file, number of keys in the file),
+    // where each sstable file has almost a max amount of keys. Keys in
+    // each sstable are sorted and non-overlapping with other sstables.
     fn generate_sstables(
         root_dir: &PathBuf,
         db_config: &DBConfig,
         num_files: i32,
-        max_per_file_size: usize,
+        max_bytes_per_file: usize,
     ) -> anyhow::Result<Vec<(PathBuf, i32)>> {
         let mut sstables_in = Vec::new();
         for file_no in 0..num_files {
@@ -145,7 +154,7 @@ mod test {
             let (mut file, pathbuf) = make_new_sstable_file(root_dir, 0)?;
             let mut writer = SSTableWriter::new(&mut file, db_config);
             let mut key_no = 0;
-            while writer.size() < max_per_file_size {
+            while writer.size() < max_bytes_per_file {
                 writer.push(
                     &format!("/f/{:0>5}/{:0>5}", file_no, key_no),
                     &EntryValue::Present(format!("val {}-{}", file_no, key_no).into_bytes()),
@@ -169,8 +178,8 @@ mod test {
 
         let root_dir: PathBuf = tmpdir.path().into();
         let db_config = DBConfig {
-            level_base_max_shards: out_num_files, // L1 = OUT_NUM_FILES*2^1
-            level_base_max_size_bytes: out_level_base_size, // OUT_SHARD_SIZE shards for level 0, OUT_SHARD_SIZE*10 shards for level 1
+            level_base_max_sstables: out_num_files, // L1 = OUT_NUM_FILES*2^1
+            level_base_max_size: out_level_base_size, // OUT_SHARD_SIZE shards for level 0, OUT_SHARD_SIZE*10 shards for level 1
             ..DBConfig::default()
         };
 
@@ -213,25 +222,16 @@ mod test {
     }
 
     #[test]
-    fn compact_l0_to_l1_with_deletions() -> anyhow::Result<()> {
+    fn compact_with_deletions() -> anyhow::Result<()> {
         let tmpdir = tempdir::TempDir::new("lsmdb")?;
         let db_config = DBConfig {
             ..Default::default()
         };
 
-        let mut ss1 = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(tmpdir.path().join("ss1"))?;
+        let mut ss1 = make_new_file(&tmpdir, "ss1")?;
+        let mut ss2 = make_new_file(&tmpdir, "ss2")?;
 
-        // in ss2, we will delete the even numbered keys
-        let mut ss2 = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(tmpdir.path().join("ss2"))?;
-
+        // put key values.
         write_to_sstable(
             (0..10)
                 .map(|num| {
@@ -245,6 +245,8 @@ mod test {
             &mut ss1,
             &db_config,
         )?;
+
+        // delete alternate key values from ss2
         write_to_sstable(
             [
                 ("/key/0".to_string(), EntryValue::Deleted),
@@ -284,8 +286,10 @@ mod test {
                 .map(|num| format!("/key/{}", num))
                 .collect::<Vec<_>>()
         );
+
         // but compacting the reverse, [ss2, ss1], should omit the deleted entries in ss2 since ss2 has precedence
-        let out_vec = compactor.compact(vec![ss2_reader, ss1_reader].into_iter(), 0)?;
+        let out_vec =
+            compactor.compact(vec![ss2_reader.try_clone()?, ss1_reader].into_iter(), 0)?;
         // small data size, so should be 1 sstable file
         assert_eq!(out_vec.len(), 1);
         let sstable_filename = &out_vec[0].1;
@@ -296,6 +300,123 @@ mod test {
                 .collect::<Vec<_>>(),
             vec!["/key/1", "/key/3", "/key/5", "/key/7", "/key/9"]
         );
+
+        assert_eq!(ss2_reader.scan("", true)?.count(), 0); // only deleted entries, so should be empty.
+
         Ok(())
+    }
+
+    #[test]
+    fn compaction_3_levels() -> anyhow::Result<()> {
+        let tmpdir = tempdir::TempDir::new("lsmdb")?;
+        let db_config = DBConfig {
+            ..Default::default()
+        };
+
+        // Compact across 3 levels, where each level has 1 sstable.
+        let mut l0_sst = make_new_file(&tmpdir, "l0")?;
+        let mut l1_sst = make_new_file(&tmpdir, "l1")?;
+        let mut l2_sst = make_new_file(&tmpdir, "l2")?;
+
+        // L2 puts 3 keys
+        // L1 deletes 1 key from L2, and puts 2 keys.
+        // L0 deletes 1 from L1, 1 from L2, and puts 1 key.
+        write_to_sstable(
+            [
+                ("/key/1".to_string(), EntryValue::Present(vec![0, 1])),
+                ("/key/2".to_string(), EntryValue::Present(vec![0, 2])),
+                ("/key/3".to_string(), EntryValue::Present(vec![0, 3])),
+            ]
+            .iter(),
+            &mut l2_sst,
+            &db_config,
+        )?;
+
+        write_to_sstable(
+            [
+                ("/key/1".to_string(), EntryValue::Deleted),
+                ("/key/4".to_string(), EntryValue::Present(vec![0, 4])),
+                ("/key/5".to_string(), EntryValue::Present(vec![0, 5])),
+            ]
+            .iter(),
+            &mut l1_sst,
+            &db_config,
+        )?;
+
+        write_to_sstable(
+            [
+                ("/key/3".to_string(), EntryValue::Deleted),
+                ("/key/4".to_string(), EntryValue::Deleted),
+                ("/key/6".to_string(), EntryValue::Present(vec![0, 6])),
+            ]
+            .iter(),
+            &mut l0_sst,
+            &db_config,
+        )?;
+
+        // compact L0 -> L1, and then compact again -> L2.
+        // The output from  L0 -> L1 should have these keys:
+        // - Present: /key/5, /key/6
+        // - Deleted: /key/1, /key/3, /key/4
+        // The output from L1 -> L2 should have these keys:
+        // - Present: /key/2, /key/5, /key/6
+        // - Deleted: /key/1, /key/3, /key/4
+        let root_dir = &tmpdir.path().to_path_buf();
+        let compactor = Compactor {
+            db_config: &db_config,
+            root_dir,
+        };
+        let new_l1_sst = compactor.compact(
+            [
+                SSTableReader::new(&root_dir.join("l0"))?,
+                SSTableReader::new(&root_dir.join("l1"))?,
+            ]
+            .into_iter(),
+            0,
+        )?;
+        assert_eq!(new_l1_sst.len(), 1);
+        let new_l1_sst_reader = SSTableReader::new(&root_dir.join(new_l1_sst[0].1.clone()))?;
+        assert_eq!(
+            new_l1_sst_reader.scan("", false)?.collect::<Vec<_>>(),
+            vec![
+                ("/key/1".to_string(), EntryValue::Deleted),
+                ("/key/3".to_string(), EntryValue::Deleted),
+                ("/key/4".to_string(), EntryValue::Deleted),
+                ("/key/5".to_string(), EntryValue::Present(vec![0, 5])),
+                ("/key/6".to_string(), EntryValue::Present(vec![0, 6])),
+            ]
+        );
+
+        let new_l2_sst = compactor.compact(
+            [
+                SSTableReader::new(&root_dir.join(new_l1_sst[0].1.clone()))?,
+                SSTableReader::new(&root_dir.join("l2"))?,
+            ]
+            .into_iter(),
+            0,
+        )?;
+        assert_eq!(new_l2_sst.len(), 1);
+        let new_l2_sst_reader = SSTableReader::new(&root_dir.join(new_l2_sst[0].1.clone()))?;
+        assert_eq!(
+            new_l2_sst_reader.scan("", false)?.collect::<Vec<_>>(),
+            vec![
+                ("/key/1".to_string(), EntryValue::Deleted),
+                ("/key/2".to_string(), EntryValue::Present(vec![0, 2])),
+                ("/key/3".to_string(), EntryValue::Deleted),
+                ("/key/4".to_string(), EntryValue::Deleted),
+                ("/key/5".to_string(), EntryValue::Present(vec![0, 5])),
+                ("/key/6".to_string(), EntryValue::Present(vec![0, 6])),
+            ]
+        );
+
+        Ok(())
+    }
+
+    fn make_new_file(tmpdir: &TempDir, filename: &str) -> Result<std::fs::File, anyhow::Error> {
+        Ok(OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .open(tmpdir.path().join(filename))?)
     }
 }
