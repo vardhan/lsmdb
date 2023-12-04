@@ -1,7 +1,7 @@
 # lsmdb
 [![lsmdb](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml/badge.svg)](https://github.com/adamlesinski/lsmdb/actions/workflows/rust.yml) [![Coverage Status](https://coveralls.io/repos/github/vardhan/lsmdb/badge.svg?branch=main&kill_cache=1)](https://coveralls.io/github/vardhan/lsmdb?branch=main)
 
-A toy log structured merge tree database for learning purposes.
+A toy log structured merge tree database.
 
 The design is based off
 [LevelDB](https://github.com/google/leveldb/blob/main/doc/impl.md) and [RocksDB](https://artem.krylysov.com/blog/2023/04/19/how-rocksdb-works/).
@@ -22,7 +22,6 @@ See db.rs for the public interface.  Roughly:
 In **rough** order:
 
 - Performance
-  * consult manifest for the candidate sstables during scan() and get()
   * mmap sstable files instead of doing file I/O
 - Concurrency
   * SSTableReader can have multiple reads and scans in-flight

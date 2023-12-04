@@ -171,23 +171,23 @@ impl DB {
             };
         }
 
+        let candidate_sstables = self.sstables.iter_mut().flat_map(|level_sstables| {
+            level_sstables
+                .iter_mut()
+                .filter(|(range, _sstable)| key >= &range.smallest && key <= &range.largest)
+                .map(|(_, sstable)| sstable)
+        });
         // Not in the memtables?  Lets try each sstable level.
         // try level 0, then 1, etc. For each level, look up the sstable shard it could be on.
-        for level_sstables in self.sstables.iter_mut() {
-            // TODO: consult the manifest and look up the right sstable instead of checking every one.
-            for (range, sstable) in level_sstables.iter_mut() {
-                if key < &range.smallest || key > &range.largest {
-                    continue; // skip this sstable since it won't have the key
-                }
-                match sstable
-                    .get(key)
-                    .map_err(|err| DBError::SSTable(err.to_string()))?
-                {
-                    Some(EntryValue::Present(value)) => return Ok(Some(value)),
-                    Some(EntryValue::Deleted) => return Ok(None),
-                    None => continue, // try the next level
-                };
-            }
+        for sstable_reader in candidate_sstables {
+            match sstable_reader
+                .get(key)
+                .map_err(|err| DBError::SSTable(err.to_string()))?
+            {
+                Some(EntryValue::Present(value)) => return Ok(Some(value)),
+                Some(EntryValue::Deleted) => return Ok(None),
+                None => continue, // try the next level
+            };
         }
 
         Ok(None)
@@ -226,23 +226,23 @@ impl DB {
                     ));
                 }
 
-                // add every sstable across every level
-                // TODO: consult the manifest and only include sstables which contain the key prefix.
-                for level in &mut self.sstables {
-                    db_iters_peekable.append(
-                        &mut level
-                            .iter_mut()
-                            // for sstable_reader in self.sstables {}
-                            .map(|sstable_reader| {
-                                KeyEValueIteratorItemPeekable::from_sstable(
-                                    &sstable_reader.1,
-                                    key_prefix,
-                                )
-                                .unwrap()
+                // Go through each level, adding every sstable which contains key prefix.
+                db_iters_peekable.extend(
+                    self.sstables
+                        .iter_mut()
+                        .flat_map(|level_sstables| {
+                            level_sstables.iter_mut().filter(|(range, _sstable)| {
+                                (range.smallest.starts_with(key_prefix)
+                                    || key_prefix >= &range.smallest)
+                                    && (range.largest.starts_with(key_prefix)
+                                        || key_prefix <= &range.largest)
                             })
-                            .collect::<Vec<_>>(),
-                    );
-                }
+                        })
+                        .map(|(_, sstable_reader)| {
+                            KeyEValueIteratorItemPeekable::from_sstable(&sstable_reader, key_prefix)
+                                .unwrap()
+                        }),
+                );
 
                 let mut heap = BinaryHeap::new();
                 let mut iter_precedence = 0; // 0 means newest
@@ -778,19 +778,20 @@ mod test {
         )?;
 
         // put() enough keys to generate 3 levels (L0, L1, L2)
+        // The keys are of the format /key/<bucket>/<random number>.
+        // The bucket is used to test scanning.
         let mut rng = rand::thread_rng();
         let mut expected = HashMap::new();
+        let mut all_buckets = ["a", "b", "c", "d", "e", "f"];
+        all_buckets.sort();
         while db.sstables.len() < 4 || db.sstables[2].len() < 2 {
             let num = rng.gen::<u32>().to_string();
-            let key = format!("/key/{}", num);
+            let bucket = all_buckets[rng.gen_range(0..all_buckets.len())];
+            let key = format!("/key/{}/{}", bucket, num);
             let val = format!("val {}", num).as_bytes().to_vec();
             db.put(key.clone(), val.clone())?;
             expected.insert(key, val);
         }
-
-        // Now ensure scan() is able to accurately scan() the expected keys.
-        let actual = db.scan("")?.collect::<HashMap<String, Vec<u8>>>();
-        assert_eq!(expected, actual);
 
         // Now delete ~50% of the keys
         let keys_to_delete = expected
@@ -822,9 +823,18 @@ mod test {
             0
         );
 
-        // Now ensure scan() is able to accurately scan() the expected keys.
+        // Make sure scan() is able to accurately scan() the expected keys.
         let actual = db.scan("")?.collect::<HashMap<String, Vec<u8>>>();
         assert_eq!(expected, actual);
+
+        // Make sure scanning with several non-empty prefixs yields the same stuff as an empty-prefix scan.
+        let mut all_keys = vec![];
+        all_buckets.sort();
+        for bucket in all_buckets {
+            all_keys.extend(db.scan(&format!("/key/{}/", bucket))?);
+        }
+
+        assert_eq!(db.scan("")?.collect::<Vec<_>>(), all_keys);
 
         Ok(())
     }
