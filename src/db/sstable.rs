@@ -7,7 +7,6 @@ use std::{
     string::FromUtf8Error
 };
 
-
 use thiserror::Error;
 
 use crate::db::{EntryValue, Key, Value, DBConfig};
@@ -86,6 +85,10 @@ impl SSTableReader {
     /// The byte size of the file backing this SSTable.
     pub(crate) fn size(&self) -> Result<u64, SSTableError> {
         Ok(self.file.metadata()?.len())
+    }
+
+    pub(crate) fn get_path(&self) -> &PathBuf {
+        &self.path
     }
 
     fn parse_index(reader: &mut File) -> Result<Vec<(String, u32, u32)>, SSTableError> {

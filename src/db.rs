@@ -325,6 +325,12 @@ impl DB {
             .unwrap(); // panic if compaction fails; TODO: should we fail more gracefully?
 
             // 3. Save the new level+1's files and empty out the previous level.
+            let files_to_gc = self.sstables[level]
+                .iter()
+                .chain(self.sstables[level + 1].iter())
+                .map(|(_range, reader)| reader.get_path().clone())
+                .collect::<Vec<_>>();
+
             self.manifest
                 .merge_level(sstables_out, level + 1)
                 .map_err(|manifest_err| DBError::ManifestError(manifest_err.to_string()))?;
@@ -333,6 +339,12 @@ impl DB {
                 .map_err(|err| DBError::SSTable(err.to_string()))?;
             self.open_level_from_manifest(level + 1)
                 .map_err(|err| DBError::SSTable(err.to_string()))?;
+
+            // 4. Delete the previous sstables.
+            for path in files_to_gc {
+                std::fs::remove_file(path)
+                    .or_else(|err| Ok(println!("couldn't remove file {}", err)))?;
+            }
         }
         Ok(())
     }

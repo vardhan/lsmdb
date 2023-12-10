@@ -22,13 +22,13 @@ See db.rs for the public interface.  Roughly:
 In **rough** order:
 
 - Performance
-  * mmap sstable files instead of doing file I/O
+  * mmap SSTableReader
+  * Bloom filter
 - Concurrency
-  * SSTableReader can have multiple reads and scans in-flight
   * Do compaction in the background
+  * SSTableReader can have multiple reads and scans in-flight
+  * Lock DB. Only 1 instance of the database can be opened.
 - Transactions
   * MVCC?
-- Benchmarks
-  * Benchmarks for consecutive read-heavy, write-heavy,
-    mixed, and with some temporal workloads.
-- Crash Recovery (WAL)
+- Crash Recovery (Write-head log)
+- Large values
