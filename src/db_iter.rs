@@ -31,7 +31,7 @@ impl<'a> KeyEValueIteratorItemPeekable<'a> {
     }
 
     pub(crate) fn from_sstable(
-        reader: &SSTableReader,
+        reader: &'a SSTableReader,
         key_prefix: &str,
     ) -> Result<KeyEValueIteratorItemPeekable<'a>, SSTableError> {
         reader

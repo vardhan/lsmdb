@@ -99,7 +99,7 @@ fn fillrandom(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::Wall
 fn readseq(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
     let (tempdir, mut db) = create_db();
 
-    for _ in 0..200_000 {
+    for _ in 0..400_000 {
         let (key, value) = (
             format!("/key/{:011}", thread_rng().gen_range(0..99_999_999_999u64)),
             gen_bytes(100),
@@ -115,7 +115,7 @@ fn readseq(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTim
             let start = Instant::now();
             let mut iter = db.scan("").unwrap();
             for _i in 0..num_iterations {
-                black_box(match iter.next() {
+                match iter.next() {
                     Some((_key, _value)) => {
                         1;
                     }
@@ -123,7 +123,8 @@ fn readseq(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTim
                         std::mem::drop(iter);
                         iter = db.scan("").unwrap();
                     }
-                });
+                };
+                black_box(());
             }
             start.elapsed()
         });
@@ -137,7 +138,7 @@ fn readrandom(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::Wall
     // 1 entry = 116 bytes.
     // 10,000 entries = 1.16 MB
     // 200,000 entries ~= 20.32 MB
-    for _ in 0..200_000 {
+    for _ in 0..400_000 {
         let key = format!("/key/{:011}", thread_rng().gen_range(0..99_999_999_999u64));
         keys.push(key.clone());
         db.put(key, gen_bytes(100)).unwrap();

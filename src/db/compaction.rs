@@ -33,14 +33,14 @@ impl<'p, 'c> Compactor<'p, 'c> {
     /// # Notes
     /// - Caller must garbage collect the files in `sstables_in`
     /// - Caller must record the new files to the `Manifest` and `DB`
-    pub(crate) fn compact<'r, I: Iterator<Item = SSTableReader>>(
+    pub(crate) fn compact<'a, I: Iterator<Item = &'a SSTableReader>>(
         &self,
         sstables_in: I,
         level_in: u32,
     ) -> Result<Vec<(KeyRange, String)>, SSTableError> {
         // make a DBIterator out of `sstables_in`.
         let iterators = sstables_in
-            .map(|reader| KeyEValueIteratorItemPeekable::from_sstable(&reader, "").unwrap())
+            .map(|reader| KeyEValueIteratorItemPeekable::from_sstable(reader, "").unwrap())
             .enumerate()
             .map(|(precedence, iter)| {
                 Reverse(KeyEValueIteratorItem(
@@ -73,7 +73,7 @@ impl<'p, 'c> Compactor<'p, 'c> {
                 first_key = Some(key.clone());
             }
             last_key = Some(key);
-            if (cur_sstable_writer.size() as u64) > sstable_max_bytes {
+            if cur_sstable_writer.size() > sstable_max_bytes {
                 // flush current sstable and rotate a new one
                 cur_sstable_writer.flush()?;
                 sstables_out.push((
@@ -189,13 +189,11 @@ mod test {
         };
 
         let sstables_in = generate_sstables(&root_dir, &db_config, in_num_files, in_shard_size)?;
-
-        let sstables_out = compactor.compact(
-            sstables_in
-                .iter()
-                .map(|(pathbuf, _)| SSTableReader::new(pathbuf).unwrap()),
-            0,
-        )?;
+        let sstable_readers_in = sstables_in
+            .iter()
+            .map(|(pathbuf, _)| SSTableReader::new(pathbuf).unwrap())
+            .collect::<Vec<_>>();
+        let sstables_out = compactor.compact(sstable_readers_in.iter(), 0)?;
 
         // we should see 6 KB input / 2.5KB per output shard = 3 files
         assert_eq!(sstables_out.len(), 3);
@@ -270,10 +268,7 @@ mod test {
             root_dir,
         };
         // compacting [ss1, ss2] should result in all numbers, since ss2 (with deleted entries) has lower precedence
-        let out_vec = compactor.compact(
-            vec![ss1_reader.try_clone()?, ss2_reader.try_clone()?].into_iter(),
-            0,
-        )?;
+        let out_vec = compactor.compact(vec![&ss1_reader, &ss2_reader].into_iter(), 0)?;
         // small data size, so should be 1 sstable file
         assert_eq!(out_vec.len(), 1);
         let sstable_filename = &out_vec[0].1;
@@ -288,8 +283,7 @@ mod test {
         );
 
         // but compacting the reverse, [ss2, ss1], should omit the deleted entries in ss2 since ss2 has precedence
-        let out_vec =
-            compactor.compact(vec![ss2_reader.try_clone()?, ss1_reader].into_iter(), 0)?;
+        let out_vec = compactor.compact(vec![&ss2_reader, &ss1_reader].into_iter(), 0)?;
         // small data size, so should be 1 sstable file
         assert_eq!(out_vec.len(), 1);
         let sstable_filename = &out_vec[0].1;
@@ -368,8 +362,8 @@ mod test {
         };
         let new_l1_sst = compactor.compact(
             [
-                SSTableReader::new(&root_dir.join("l0"))?,
-                SSTableReader::new(&root_dir.join("l1"))?,
+                &SSTableReader::new(&root_dir.join("l0"))?,
+                &SSTableReader::new(&root_dir.join("l1"))?,
             ]
             .into_iter(),
             0,
@@ -389,8 +383,8 @@ mod test {
 
         let new_l2_sst = compactor.compact(
             [
-                SSTableReader::new(&root_dir.join(new_l1_sst[0].1.clone()))?,
-                SSTableReader::new(&root_dir.join("l2"))?,
+                &SSTableReader::new(&root_dir.join(new_l1_sst[0].1.clone()))?,
+                &SSTableReader::new(&root_dir.join("l2"))?,
             ]
             .into_iter(),
             0,

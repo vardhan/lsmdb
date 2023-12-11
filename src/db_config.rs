@@ -29,11 +29,11 @@ impl Default for DBConfig {
 }
 
 impl DBConfig {
-    pub fn level_max_size(&self, level: u32) -> u64 {
-        self.level_base_max_size * 10u64.pow(level)
+    pub fn level_max_size(&self, level: u32) -> usize {
+        (self.level_base_max_size * 10u64.pow(level)) as usize
     }
 
-    pub fn level_max_sstables(&self, level: u32) -> u64 {
-        self.level_base_max_sstables * 2_u64.pow(level)
+    pub fn level_max_sstables(&self, level: u32) -> usize {
+        (self.level_base_max_sstables * 2_u64.pow(level)) as usize
     }
 }

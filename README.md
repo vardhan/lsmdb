@@ -22,7 +22,6 @@ See db.rs for the public interface.  Roughly:
 In **rough** order:
 
 - Performance
-  * mmap SSTableReader
   * Bloom filter
 - Concurrency
   * Do compaction in the background
@@ -30,5 +29,5 @@ In **rough** order:
   * Lock DB. Only 1 instance of the database can be opened.
 - Transactions
   * MVCC?
-- Crash Recovery (Write-head log)
+- Crash Recovery (write ahead log)
 - Large values

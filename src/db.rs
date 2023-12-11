@@ -229,9 +229,9 @@ impl DB {
                 // Go through each level, adding every sstable which contains key prefix.
                 db_iters_peekable.extend(
                     self.sstables
-                        .iter_mut()
+                        .iter()
                         .flat_map(|level_sstables| {
-                            level_sstables.iter_mut().filter(|(range, _sstable)| {
+                            level_sstables.iter().filter(|(range, _sstable)| {
                                 (range.smallest.starts_with(key_prefix)
                                     || key_prefix >= &range.smallest)
                                     && (range.largest.starts_with(key_prefix)
@@ -239,7 +239,7 @@ impl DB {
                             })
                         })
                         .map(|(_, sstable_reader)| {
-                            KeyEValueIteratorItemPeekable::from_sstable(&sstable_reader, key_prefix)
+                            KeyEValueIteratorItemPeekable::from_sstable(sstable_reader, key_prefix)
                                 .unwrap()
                         }),
                 );
@@ -319,7 +319,7 @@ impl DB {
                 self.sstables[level]
                     .iter()
                     .chain(self.sstables[level + 1].iter())
-                    .map(|(_range, reader)| reader.try_clone().unwrap()),
+                    .map(|(_range, reader)| reader),
                 level as u32,
             )
             .unwrap(); // panic if compaction fails; TODO: should we fail more gracefully?
@@ -371,7 +371,7 @@ impl DB {
         Ok(())
     }
 
-    fn compute_level_size(&self, level: u32) -> Result<u64, SSTableError> {
+    fn compute_level_size(&self, level: u32) -> Result<usize, SSTableError> {
         self.sstables[level as usize]
             .iter()
             .map(|(_range, reader)| reader.size())

@@ -1,3 +1,4 @@
+
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
@@ -7,6 +8,7 @@ use std::{
     string::FromUtf8Error
 };
 
+use memmap2::Mmap;
 use thiserror::Error;
 
 use crate::db::{EntryValue, Key, Value, DBConfig};
@@ -61,7 +63,7 @@ use super::reader_ext::ReaderExt;
 pub(crate) struct SSTableReader {
     path: PathBuf,
 
-    file: File,
+    mmap: memmap2::Mmap,
 
     // (last_key, block byte offset, block size), sorted by last_key ascending.
     block_index: Vec<(String, u32, u32)>,
@@ -72,26 +74,25 @@ impl SSTableReader {
     ///
     /// Returns an error if the SSTable's index is corrupt or malformed.
     pub(crate) fn new(path: &PathBuf) -> Result<Self, SSTableError> {
-        let mut file: File = std::fs::File::open(path.clone())?;
-        let block_index: Vec<(String, u32, u32)> = Self::parse_index(&mut file)?;
-        Ok(SSTableReader { path: path.clone(), file, block_index })
-    }
-
-    /// Returns the try clone of this [`SSTableReader`].
-    pub(crate) fn try_clone(&self) -> Result<Self, SSTableError> {
-        SSTableReader::new(&self.path)
+        let file: File = std::fs::File::open(path.clone())?;
+        // TODO: fail softer than .unwrap()?
+        let mmap = unsafe { Mmap::map(&file).unwrap() };
+        let block_index: Vec<(String, u32, u32)> = Self::parse_index(&mmap)?;
+        Ok(SSTableReader { path: path.clone(), mmap, block_index })
     }
 
     /// The byte size of the file backing this SSTable.
-    pub(crate) fn size(&self) -> Result<u64, SSTableError> {
-        Ok(self.file.metadata()?.len())
+    pub(crate) fn size(&self) -> Result<usize, SSTableError> {
+        Ok(self.mmap.len())
     }
 
     pub(crate) fn get_path(&self) -> &PathBuf {
         &self.path
     }
 
-    fn parse_index(reader: &mut File) -> Result<Vec<(String, u32, u32)>, SSTableError> {
+    fn parse_index(mmap: &Mmap) -> Result<Vec<(String, u32, u32)>, SSTableError> {
+        let mut reader = std::io::Cursor::new(mmap);
+
         // Parse the sstable index size (last 4 bytes)
         reader.seek(SeekFrom::End(-(size_of::<u32>() as i64)))?;
         let index_size = reader.read_u32_le()?;
@@ -130,7 +131,7 @@ impl SSTableReader {
             Some(idx) => {
                 let (_, block_offset, block_size) = self.block_index[idx];
                 // TODO: cache the BlockReader
-                let mut block_reader = BlockReader::new(&mut self.file, block_offset, block_size)?;
+                let mut block_reader = BlockReader::new(std::io::Cursor::new(&self.mmap), block_offset, block_size)?;
                 block_reader.get(key)?
             }
         })
@@ -160,7 +161,7 @@ impl SSTableReader {
         let (block_idx, mut block_reader) = match self.get_candidate_block(key_prefix) {
             Some(idx) => {
                 let (_, block_offset, block_size) = self.block_index[idx];
-                (idx, BlockReader::new(self.file.try_clone()?, block_offset, block_size)
+                (idx, BlockReader::new(std::io::Cursor::new(&self.mmap), block_offset, block_size)
                     .unwrap())
             }
             None => {
@@ -171,7 +172,7 @@ impl SSTableReader {
             Ok(_) =>  {
                 Ok(SSTableIterator {
                         key_prefix: key_prefix.to_string(),
-                        sst_reader: Some(self.try_clone().unwrap()),
+                        sst_reader: Some(self),
                         skip_deleted,
                         // (block index, block reader)
                         cur_block: Some((block_idx, block_reader)),
@@ -184,19 +185,19 @@ impl SSTableReader {
 }
 
 /// This iterator is constructed using [`SSTableReader::scan`].
-pub(crate) struct SSTableIterator {
+pub(crate) struct SSTableIterator<'a> {
     key_prefix: String,
-    sst_reader: Option<SSTableReader>,
+    sst_reader: Option<&'a SSTableReader>,
     skip_deleted: bool,
     // (block index, block reader)
-    cur_block: Option<(usize, BlockReader<File>)>,
+    cur_block: Option<(usize, BlockReader<std::io::Cursor<&'a Mmap>>)>,
 }
-impl SSTableIterator {
-    fn empty() -> SSTableIterator {
+impl<'a> SSTableIterator<'a> {
+    fn empty() -> SSTableIterator<'a> {
         SSTableIterator { key_prefix: "".to_string(), sst_reader: None, skip_deleted: true, cur_block: None }
     }
 }
-impl<'a> Iterator for SSTableIterator {
+impl<'a> Iterator for SSTableIterator<'a> {
     type Item = (Key, EntryValue);
 
     /// next() scans through blocks looking for the `key_prefix` used to construct this Iterator.
@@ -227,12 +228,8 @@ impl<'a> Iterator for SSTableIterator {
                     if block_idx < sst_reader.block_index.len() {
                         // (last_key, block byte offset, block size)
                         let (_, block_offset, block_size) = sst_reader.block_index[block_idx];
-                        let sst_file = sst_reader.file.try_clone();
-                        if sst_file.is_err() {
-                            return None;
-                        }
                         self.cur_block =
-                            BlockReader::new(sst_file.unwrap(), block_offset, block_size)
+                            BlockReader::new(std::io::Cursor::new(&sst_reader.mmap), block_offset, block_size)
                             .ok()
                             .map(|block_reader| (block_idx, block_reader));
                         continue 'read_block_entry;
