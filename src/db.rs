@@ -321,6 +321,7 @@ impl DB {
                     .chain(self.sstables[level + 1].iter())
                     .map(|(_range, reader)| reader),
                 level as u32,
+                level == self.sstables.len(),
             )
             .unwrap(); // panic if compaction fails; TODO: should we fail more gracefully?
 

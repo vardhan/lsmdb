@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     sstable::{SSTableError, SSTableWriter},
-    DBConfig,
+    DBConfig, EntryValue,
 };
 
 pub(crate) struct Compactor<'p, 'c> {
@@ -37,6 +37,7 @@ impl<'p, 'c> Compactor<'p, 'c> {
         &self,
         sstables_in: I,
         level_in: u32,
+        is_final_level: bool,
     ) -> Result<Vec<(KeyRange, String)>, SSTableError> {
         // make a DBIterator out of `sstables_in`.
         let iterators = sstables_in
@@ -68,6 +69,11 @@ impl<'p, 'c> Compactor<'p, 'c> {
             should_skip_deleted: false,
         };
         for (key, value) in iter {
+            if let EntryValue::Deleted = value {
+                if is_final_level {
+                    continue;
+                }
+            }
             cur_sstable_writer.push(&key, &value)?;
             if first_key.is_none() {
                 first_key = Some(key.clone());
@@ -193,7 +199,7 @@ mod test {
             .iter()
             .map(|(pathbuf, _)| SSTableReader::new(pathbuf).unwrap())
             .collect::<Vec<_>>();
-        let sstables_out = compactor.compact(sstable_readers_in.iter(), 0)?;
+        let sstables_out = compactor.compact(sstable_readers_in.iter(), 0, false)?;
 
         // we should see 6 KB input / 2.5KB per output shard = 3 files
         assert_eq!(sstables_out.len(), 3);
@@ -268,7 +274,7 @@ mod test {
             root_dir,
         };
         // compacting [ss1, ss2] should result in all numbers, since ss2 (with deleted entries) has lower precedence
-        let out_vec = compactor.compact(vec![&ss1_reader, &ss2_reader].into_iter(), 0)?;
+        let out_vec = compactor.compact(vec![&ss1_reader, &ss2_reader].into_iter(), 0, false)?;
         // small data size, so should be 1 sstable file
         assert_eq!(out_vec.len(), 1);
         let sstable_filename = &out_vec[0].1;
@@ -283,7 +289,7 @@ mod test {
         );
 
         // but compacting the reverse, [ss2, ss1], should omit the deleted entries in ss2 since ss2 has precedence
-        let out_vec = compactor.compact(vec![&ss2_reader, &ss1_reader].into_iter(), 0)?;
+        let out_vec = compactor.compact(vec![&ss2_reader, &ss1_reader].into_iter(), 0, false)?;
         // small data size, so should be 1 sstable file
         assert_eq!(out_vec.len(), 1);
         let sstable_filename = &out_vec[0].1;
@@ -367,6 +373,7 @@ mod test {
             ]
             .into_iter(),
             0,
+            false,
         )?;
         assert_eq!(new_l1_sst.len(), 1);
         let new_l1_sst_reader = SSTableReader::new(&root_dir.join(new_l1_sst[0].1.clone()))?;
@@ -388,6 +395,7 @@ mod test {
             ]
             .into_iter(),
             0,
+            false,
         )?;
         assert_eq!(new_l2_sst.len(), 1);
         let new_l2_sst_reader = SSTableReader::new(&root_dir.join(new_l2_sst[0].1.clone()))?;
@@ -403,6 +411,68 @@ mod test {
             ]
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn compact_deletions_in_final_level() -> anyhow::Result<()> {
+        let tmpdir = tempdir::TempDir::new("lsmdb")?;
+        let db_config = DBConfig {
+            ..Default::default()
+        };
+
+        // Compact across 3 levels, where each level has 1 sstable.
+        let mut l0_sst = make_new_file(&tmpdir, "l0")?;
+        write_to_sstable(
+            [
+                ("/key/deleted".to_string(), EntryValue::Deleted),
+                ("/key/present1".to_string(), EntryValue::Present(vec![0])),
+                ("/key/present2".to_string(), EntryValue::Present(vec![0])),
+            ]
+            .iter(),
+            &mut l0_sst,
+            &db_config,
+        )?;
+
+        let root_dir = &tmpdir.path().to_path_buf();
+        let compactor = Compactor {
+            db_config: &db_config,
+            root_dir,
+        };
+        let new_l1_sst = compactor.compact(
+            [&SSTableReader::new(&root_dir.join("l0"))?].into_iter(),
+            0,
+            false,
+        )?;
+        assert_eq!(new_l1_sst.len(), 1);
+
+        assert_eq!(
+            SSTableReader::new(&root_dir.join(&new_l1_sst[0].1))?
+                .scan("", false)?
+                .collect::<Vec<_>>(),
+            vec![
+                ("/key/deleted".to_string(), EntryValue::Deleted),
+                ("/key/present1".to_string(), EntryValue::Present(vec![0])),
+                ("/key/present2".to_string(), EntryValue::Present(vec![0]))
+            ]
+        );
+
+        let new_l1_sst = compactor.compact(
+            [&SSTableReader::new(&root_dir.join("l0"))?].into_iter(),
+            0,
+            true,
+        )?;
+        assert_eq!(new_l1_sst.len(), 1);
+
+        assert_eq!(
+            SSTableReader::new(&root_dir.join(&new_l1_sst[0].1))?
+                .scan("", false)?
+                .collect::<Vec<_>>(),
+            vec![
+                ("/key/present1".to_string(), EntryValue::Present(vec![0])),
+                ("/key/present2".to_string(), EntryValue::Present(vec![0]))
+            ]
+        );
         Ok(())
     }
 
