@@ -110,7 +110,7 @@ fn readseq(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTim
             let start = Instant::now();
             let mut iter = db.scan("").unwrap();
             for _i in 0..num_iterations {
-                black_box(match iter.next() {
+                match iter.next() {
                     Some((_key, _value)) => {
                         1;
                     }
@@ -118,7 +118,8 @@ fn readseq(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTim
                         std::mem::drop(iter);
                         iter = db.scan("").unwrap();
                     }
-                });
+                };
+                black_box(());
             }
             start.elapsed()
         });

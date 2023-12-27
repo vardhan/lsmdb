@@ -4,10 +4,12 @@ use crate::db_iter::{
 };
 
 mod compaction;
+mod log;
 mod manifest;
 mod reader_ext;
 pub(crate) mod sstable;
 
+use serde::{Deserialize, Serialize};
 use sstable::SSTableError;
 use std::{
     cmp::Reverse,
@@ -16,6 +18,7 @@ use std::{
 };
 use thiserror::Error;
 
+use self::log::{LogIterator, LogWriter};
 use self::{
     compaction::Compactor,
     manifest::{KeyRange, Manifest},
@@ -41,12 +44,15 @@ pub enum DBError {
 
     #[error("ManifestError: {0}")]
     ManifestError(String),
+
+    #[error("LogError: {0}")]
+    LogError(String),
 }
 
 pub type Key = String;
 pub type Value = Vec<u8>;
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum EntryValue {
     Present(Value),
     Deleted,
@@ -81,6 +87,9 @@ pub struct DB {
     // level >= 1 have non-overlapping keys.
     sstables: Vec<VecDeque<(KeyRange, SSTableReader)>>,
 
+    // Write ahead log.
+    log: LogWriter,
+
     // Active memtable, the latest source of data mutations
     active_memtable: Memtable,
 
@@ -114,15 +123,26 @@ impl DB {
         let manifest = Manifest::open(&root_dir.to_path_buf())
             .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e)))?;
         let sstables = Self::open_all_sstables(&manifest)?;
-        Ok(DB {
+        let log =
+            LogWriter::new(&root_dir.join("LOG")).map_err(|e| DBError::LogError(e.to_string()))?;
+
+        let mut db = DB {
             root_dir: root_dir.into(),
             manifest,
             sstables,
+            log,
             active_memtable: BTreeMap::new(),
             active_memtable_size: 0,
             frozen_memtables: VecDeque::<Memtable>::new(),
             config,
-        })
+        };
+        let log_iter = LogIterator::open(&root_dir.join("LOG"))
+            .map_err(|err| DBError::LogError(err.to_string()))?;
+        for (key, entry) in log_iter {
+            db.put_entry_into_active_memtable(key, entry);
+        }
+
+        Ok(db)
     }
 
     // Opens all SSTable files stored under given the `root_dir` directory.
@@ -266,6 +286,31 @@ impl DB {
     }
 
     fn put_entry(&mut self, key: Key, entry: EntryValue) -> Result<(), DBError> {
+        self.log
+            .put(&key, &entry)
+            .map_err(|err| DBError::LogError(err.to_string()))?;
+
+        self.put_entry_into_active_memtable(key, entry);
+        if self.active_memtable_size >= self.config.max_active_memtable_size {
+            self.freeze_active_memtable()
+                .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
+        }
+        // Is it time to compact memtables into L0?
+        if self.frozen_memtables.len() > self.config.max_frozen_memtables {
+            self.flush_frozen_memtables_to_sstable()
+                .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
+
+            self.log
+                .clear()
+                .map_err(|log_err| DBError::LogError(log_err.to_string()))?;
+
+            // is L0 too big?
+            self.compact_if_l0_full()?;
+        }
+        Ok(())
+    }
+
+    fn put_entry_into_active_memtable(&mut self, key: String, entry: EntryValue) {
         let key_len = key.as_bytes().len();
         let value_len = entry.len();
         match self.active_memtable.insert(key, entry) {
@@ -278,19 +323,6 @@ impl DB {
                 self.active_memtable_size += value_len;
             }
         }
-        if self.active_memtable_size >= self.config.max_active_memtable_size {
-            self.freeze_active_memtable()
-                .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
-        }
-        // Is it time to compact memtables into L0?
-        if self.frozen_memtables.len() > self.config.max_frozen_memtables {
-            self.flush_frozen_memtables_to_sstable()
-                .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
-
-            // is L0 too big?
-            self.compact_if_l0_full()?;
-        }
-        Ok(())
     }
 
     // If L0 is full, starts the compaction process which compacts each level into the next if its too big.
@@ -383,6 +415,8 @@ impl DB {
         self.frozen_memtables
             .push_front(std::mem::take(&mut self.active_memtable));
         self.active_memtable_size = 0;
+
+        // rotate logs
         Ok(())
     }
 
@@ -848,6 +882,51 @@ mod test {
         }
 
         assert_eq!(db.scan("")?.collect::<Vec<_>>(), all_keys);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resume_open_close() -> anyhow::Result<()> {
+        // test the WAL:
+        // - test that closing a database and opening it up again retains keys and values
+        let tmpdir = tempdir::TempDir::new("lsmdb")?;
+        let mut db = DB::open_with_config(
+            tmpdir.path(),
+            DBConfig {
+                max_active_memtable_size: 1024 * 4, // 4KB per memtable / L0 sstable
+                max_frozen_memtables: 2,            // 2 frozen memtables before flushing sstable
+                ..DBConfig::default()
+            },
+        )?;
+
+        // keep filling keys until we have an 2 frozen memtables, and a non-empty active memtable.
+        let mut num_keys = 0i32;
+        while db.frozen_memtables.len() < 2 || db.active_memtable.is_empty() {
+            db.put(format!("/key/{}", num_keys), vec![(num_keys % 255) as u8])?;
+            num_keys += 1;
+        }
+
+        assert_eq!(db.sstables.len(), 0); // there are no sstables
+
+        // now close the database and open it up again -- test that all the data is there.
+        std::mem::drop(db);
+        let mut db = DB::open_with_config(
+            tmpdir.path(),
+            DBConfig {
+                max_active_memtable_size: 1024 * 4, // 4KB per memtable / L0 sstable
+                max_frozen_memtables: 2,            // 2 frozen memtables before flushing sstable
+                ..DBConfig::default()
+            },
+        )?;
+
+        assert!(!db.active_memtable.is_empty());
+        assert_eq!(db.sstables.len(), 0);
+
+        // check that the keys we made earlier still exist:
+        for key in 0..num_keys {
+            assert!(matches!(db.get(&format!("/key/{}", key)), Ok(Some(_))));
+        }
 
         Ok(())
     }
