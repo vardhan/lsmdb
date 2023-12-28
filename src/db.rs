@@ -116,6 +116,9 @@ impl DB {
         DB::open_with_config(root_dir, DBConfig::default())
     }
 
+    /// Close the database.
+    pub fn close(self) {}
+
     /// Opens the database at `root_path` using configuration provided by `config`, and creates one if it doesn't exists.
     ///
     /// `root_dir` is the directory where data files will live.
@@ -687,8 +690,8 @@ mod test {
         assert_eq!(db.sstables[0].len(), keys.len());
 
         // sstables should now be persisted -- test that they are accessible when db is re-opened
-        std::mem::drop(db);
-        let mut db: DB = DB::open_with_config(
+        db.close();
+        db = DB::open_with_config(
             tmpdir.path(),
             DBConfig {
                 // No automatic flushing; all manual for now
@@ -910,8 +913,8 @@ mod test {
         assert_eq!(db.sstables.len(), 0); // there are no sstables
 
         // now close the database and open it up again -- test that all the data is there.
-        std::mem::drop(db);
-        let mut db = DB::open_with_config(
+        db.close();
+        db = DB::open_with_config(
             tmpdir.path(),
             DBConfig {
                 max_active_memtable_size: 1024 * 4, // 4KB per memtable / L0 sstable
