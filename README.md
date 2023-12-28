@@ -22,12 +22,11 @@ See db.rs for the public interface.  Roughly:
 In **rough** order:
 
 - Performance
-  * Bloom filter
+  * Bloom filter for each sstable
 - Concurrency
   * Do compaction in the background
   * SSTableReader can have multiple reads and scans in-flight
   * Lock DB. Only 1 instance of the database can be opened.
 - Transactions
   * MVCC?
-- Crash Recovery (write ahead log)
 - Large values
