@@ -37,10 +37,7 @@ impl LogEntry {
             self.key.len(),
             self.key.as_bytes(),
             &self.value,
-            match &self.value {
-                EntryValue::Present(val) => val.len(),
-                EntryValue::Deleted => 0,
-            },
+            self.value.len(),
         )
         .map_err(|err| LogError::SerializeError(err.to_string()))?;
 
@@ -64,7 +61,10 @@ pub(crate) struct LogWriter {
     writer: File,
 }
 
+/// LogWriter appends key-value to the end of a log file.  This is used for implementing write-ahead-logging.
+/// To read out all the key-values in a log, use [LogIterator].
 impl LogWriter {
+    /// Creates or re-opens log file.
     pub(crate) fn new(path: &PathBuf) -> Result<LogWriter, LogError> {
         let writer = OpenOptions::new()
             .create(true)
@@ -76,6 +76,7 @@ impl LogWriter {
         })
     }
 
+    /// Appends the (key, value) to the end of the log
     pub(crate) fn put(&mut self, key: &Key, value: &EntryValue) -> Result<(), LogError> {
         let entry = LogEntry {
             key: key.to_string(),
@@ -87,6 +88,7 @@ impl LogWriter {
         Ok(())
     }
 
+    /// Clears the contents of the log file -- there will be no entries after this.
     pub(crate) fn clear(&mut self) -> Result<(), LogError> {
         let writer = OpenOptions::new()
             .truncate(true)
@@ -105,7 +107,9 @@ pub(crate) struct LogIterator {
     reader: File,
 }
 
+/// LogIterator provides an API to read all the key-value entries in a log.
 impl LogIterator {
+    // After calling open(), LogIterator can be used as an iterator to read each key-value entry.
     pub(crate) fn open(path: &PathBuf) -> Result<LogIterator, LogError> {
         Ok(LogIterator {
             reader: OpenOptions::new().read(true).open(path)?,

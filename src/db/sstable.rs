@@ -463,15 +463,11 @@ impl<'c> BlockWriter<'c> {
         size_of::<u32>() // key length
         + key.len()
         + 1 // presence bit (present or deleted)
-        + match &entry {
-            EntryValue::Present(pentry) => 
-                size_of::<u32>() // value length
-                + pentry.len(),
-            EntryValue::Deleted => 0
-        }
+        + entry.len()
         + size_of::<u32>() // byte offset for block footer
     }
 
+    /// Writes the given key and entry into `dest`.
     pub(crate) fn write_entry(
         dest: &mut impl Write,
         key_len: usize,
@@ -481,7 +477,7 @@ impl<'c> BlockWriter<'c> {
     ) -> Result<(), SSTableError> {
         dest.write_all(&(key_len as u32).to_le_bytes())?;
         dest.write_all(key_bytes)?;
-        Ok(match entry {
+        match entry {
             EntryValue::Present(value_bytes) => {
                 dest.write_all(&1u8.to_le_bytes())?;
                 dest.write_all(&(value_len as u32).to_le_bytes())?;
@@ -490,7 +486,8 @@ impl<'c> BlockWriter<'c> {
             EntryValue::Deleted => {
                 dest.write_all(&0u8.to_le_bytes())?;
             }
-        })
+        };
+        Ok(())
     }
 
     /// An estimated size of the block so far.
@@ -567,7 +564,10 @@ impl<R: Read + Seek> BlockReader<R> {
         // TODO: do a binary search instead
         for i in 0..self.num_entries {
             self.entry_cursor = i;
-            let ((entry_key, _), entry_val) = (read_next_key(&mut self.reader)?, read_next_value(&mut self.reader)?);
+            let ((entry_key, _), entry_val) = (
+                read_next_key(&mut self.reader)?,
+                read_next_value(&mut self.reader)?,
+            );
             if key == entry_key {
                 return Ok(Some(entry_val));
             }
@@ -615,7 +615,6 @@ impl<R: Read + Seek> BlockReader<R> {
         Err(SSTableError::KeyPrefixNotFound)
     }
 }
-
 
 // reads and returns the next key, along with total # of bytes read.
 pub(crate) fn read_next_key(reader: &mut impl Read) -> Result<(Key, usize), SSTableError> {
