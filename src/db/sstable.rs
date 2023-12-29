@@ -1,17 +1,16 @@
-
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     mem::size_of,
     path::PathBuf,
     str::Utf8Error,
-    string::FromUtf8Error
+    string::FromUtf8Error,
 };
 
 use memmap2::Mmap;
 use thiserror::Error;
 
-use crate::db::{EntryValue, Key, Value, DBConfig};
+use crate::db::{DBConfig, EntryValue, Key, Value};
 
 use super::reader_ext::ReaderExt;
 
@@ -78,7 +77,11 @@ impl SSTableReader {
         // TODO: fail softer than .unwrap()?
         let mmap = unsafe { Mmap::map(&file).unwrap() };
         let block_index: Vec<(String, u32, u32)> = Self::parse_index(&mmap)?;
-        Ok(SSTableReader { path: path.clone(), mmap, block_index })
+        Ok(SSTableReader {
+            path: path.clone(),
+            mmap,
+            block_index,
+        })
     }
 
     /// The byte size of the file backing this SSTable.
@@ -131,7 +134,8 @@ impl SSTableReader {
             Some(idx) => {
                 let (_, block_offset, block_size) = self.block_index[idx];
                 // TODO: cache the BlockReader
-                let mut block_reader = BlockReader::new(std::io::Cursor::new(&self.mmap), block_offset, block_size)?;
+                let mut block_reader =
+                    BlockReader::new(std::io::Cursor::new(&self.mmap), block_offset, block_size)?;
                 block_reader.get(key)?
             }
         })
@@ -157,29 +161,36 @@ impl SSTableReader {
 
     /// Iterates the SSTable for keys beginning with `key_prefix`.
     /// Iterator yields keys in ascending sorted order. Deleted entries are skipped.
-    pub(crate) fn scan(&self, key_prefix: &str, skip_deleted: bool) -> Result<SSTableIterator, SSTableError> {
+    pub(crate) fn scan(
+        &self,
+        key_prefix: &str,
+        skip_deleted: bool,
+    ) -> Result<SSTableIterator, SSTableError> {
         let (block_idx, mut block_reader) = match self.get_candidate_block(key_prefix) {
             Some(idx) => {
                 let (_, block_offset, block_size) = self.block_index[idx];
-                (idx, BlockReader::new(std::io::Cursor::new(&self.mmap), block_offset, block_size)
-                    .unwrap())
+                (
+                    idx,
+                    BlockReader::new(std::io::Cursor::new(&self.mmap), block_offset, block_size)
+                        .unwrap(),
+                )
             }
             None => {
                 return Ok(SSTableIterator::empty());
             }
         };
         match block_reader.seek(key_prefix) {
-            Ok(_) =>  {
+            Ok(_) => {
                 Ok(SSTableIterator {
-                        key_prefix: key_prefix.to_string(),
-                        sst_reader: Some(self),
-                        skip_deleted,
-                        // (block index, block reader)
-                        cur_block: Some((block_idx, block_reader)),
+                    key_prefix: key_prefix.to_string(),
+                    sst_reader: Some(self),
+                    skip_deleted,
+                    // (block index, block reader)
+                    cur_block: Some((block_idx, block_reader)),
                 })
-            },
+            }
             Err(SSTableError::KeyPrefixNotFound) => Ok(SSTableIterator::empty()),
-            Err(err) => Err(err)
+            Err(err) => Err(err),
         }
     }
 }
@@ -194,7 +205,12 @@ pub(crate) struct SSTableIterator<'a> {
 }
 impl<'a> SSTableIterator<'a> {
     fn empty() -> SSTableIterator<'a> {
-        SSTableIterator { key_prefix: "".to_string(), sst_reader: None, skip_deleted: true, cur_block: None }
+        SSTableIterator {
+            key_prefix: "".to_string(),
+            sst_reader: None,
+            skip_deleted: true,
+            cur_block: None,
+        }
     }
 }
 impl<'a> Iterator for SSTableIterator<'a> {
@@ -212,13 +228,15 @@ impl<'a> Iterator for SSTableIterator<'a> {
             self.cur_block.as_ref()?;
             let (_cur_block_idx, ref mut cur_block_reader) = self.cur_block.as_mut().unwrap();
             match cur_block_reader.read_next_entry() {
-                Ok((key, EntryValue::Present(value))) if key.starts_with(&self.key_prefix) => return Some((key, EntryValue::Present(value))),
+                Ok((key, EntryValue::Present(value))) if key.starts_with(&self.key_prefix) => {
+                    return Some((key, EntryValue::Present(value)))
+                }
                 Ok((key, EntryValue::Deleted)) if key.starts_with(&self.key_prefix) => {
                     if self.skip_deleted {
                         continue 'read_block_entry;
                     }
                     return Some((key, EntryValue::Deleted));
-                },
+                }
                 Ok(_) => return None,
                 Err(SSTableError::KeyPrefixNotFound) => return None,
                 Err(SSTableError::EndOfBlock) => {
@@ -228,10 +246,13 @@ impl<'a> Iterator for SSTableIterator<'a> {
                     if block_idx < sst_reader.block_index.len() {
                         // (last_key, block byte offset, block size)
                         let (_, block_offset, block_size) = sst_reader.block_index[block_idx];
-                        self.cur_block =
-                            BlockReader::new(std::io::Cursor::new(&sst_reader.mmap), block_offset, block_size)
-                            .ok()
-                            .map(|block_reader| (block_idx, block_reader));
+                        self.cur_block = BlockReader::new(
+                            std::io::Cursor::new(&sst_reader.mmap),
+                            block_offset,
+                            block_size,
+                        )
+                        .ok()
+                        .map(|block_reader| (block_idx, block_reader));
                         continue 'read_block_entry;
                     } else {
                         self.cur_block = None;
@@ -243,7 +264,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
         }
     }
 }
-pub(crate) struct SSTableWriter<'w,'c, W> {
+pub(crate) struct SSTableWriter<'w, 'c, W> {
     /// Underlying writer to write the sstable to
     writer: &'w mut W,
 
@@ -269,9 +290,8 @@ pub(crate) struct SSTableWriter<'w,'c, W> {
 
 impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
     pub(crate) fn new(writer: &'w mut W, db_config: &'c DBConfig) -> SSTableWriter<'w, 'c, W> {
-        let sstable_index_byte_size =
-            size_of::<u32>(); // byte size of the sstable index (u32)
-        SSTableWriter{
+        let sstable_index_byte_size = size_of::<u32>(); // byte size of the sstable index (u32)
+        SSTableWriter {
             writer,
             bytes_written_so_far: 0,
             sstable_index_byte_size,
@@ -282,14 +302,15 @@ impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
         }
     }
 
-    pub(crate) fn push(&mut self, key: &Key, entry: &EntryValue) -> Result<(), SSTableError>{
+    pub(crate) fn push(&mut self, key: &Key, entry: &EntryValue) -> Result<(), SSTableError> {
         match self.cur_block_writer.push(key, entry) {
             Ok(bytes_written) => {
                 self.bytes_written_so_far += bytes_written;
             }
             Err(SSTableError::BlockSizeOverflow) => {
                 // flush the current block to the `writer`, make a new block and add entry to it.
-                let prev_block_writer = std::mem::replace(&mut self.cur_block_writer, BlockWriter::new(self.db_config));
+                let prev_block_writer =
+                    std::mem::replace(&mut self.cur_block_writer, BlockWriter::new(self.db_config));
                 let (block_size, last_key) = prev_block_writer.flush(self.writer)?;
                 self.sstable_index_byte_size +=
                     size_of::<u32>() // block size (u32)
@@ -299,7 +320,8 @@ impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
                 self.block_sizes.push((block_size, last_key));
                 self.bytes_written_so_far += block_size;
                 self.cur_block_writer = BlockWriter::new(self.db_config);
-                self.bytes_written_so_far += self.cur_block_writer
+                self.bytes_written_so_far += self
+                    .cur_block_writer
                     .push(key, entry)
                     .expect("single key/value won't fit in block");
             }
@@ -312,15 +334,17 @@ impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
     /// Computed size of the sstable if it were to be flush()'d.
     pub(crate) fn size(&self) -> usize {
         // written bytes so far + size of the sstable index so far + pending final block entry sstable
-        self.bytes_written_so_far + self.sstable_index_byte_size
-         + (size_of::<u32>() + self.prev_key_byte_size) // (last key byte size, the last key)
+        self.bytes_written_so_far
+            + self.sstable_index_byte_size
+            + (size_of::<u32>() + self.prev_key_byte_size) // (last key byte size, the last key)
     }
 
     /// Flushes the sstable index.
     /// After this call, the sstable file is ready to be used with SSTableReader.
     pub(crate) fn flush(mut self) -> Result<(), SSTableError> {
         // flush the last block.
-        self.block_sizes.push(self.cur_block_writer.flush(self.writer)?);
+        self.block_sizes
+            .push(self.cur_block_writer.flush(self.writer)?);
 
         // write out the sstable index (i.e., the footer):
         // - block #1 size in bytes (4 bytes), last key length (4 bytes), last key (variable length)
@@ -335,7 +359,8 @@ impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
             self.writer.write_all(&(block_size as u32).to_le_bytes())?;
 
             index_size += size_of::<u32>() as u32;
-            self.writer.write_all(&(last_key.len() as u32).to_le_bytes())?;
+            self.writer
+                .write_all(&(last_key.len() as u32).to_le_bytes())?;
 
             let last_key_bytes = last_key.as_bytes();
             index_size += last_key_bytes.len() as u32;
@@ -349,7 +374,7 @@ impl<'w, 'c, W: Write> SSTableWriter<'w, 'c, W> {
 
 #[cfg(test)]
 pub(crate) fn write_to_sstable<'kv>(
-    kv_iter: impl Iterator<Item=&'kv (Key, EntryValue)>,
+    kv_iter: impl Iterator<Item = &'kv (Key, EntryValue)>,
     writer: &mut impl Write,
     db_config: &DBConfig,
 ) -> Result<(), SSTableError> {
@@ -422,38 +447,51 @@ impl<'c> BlockWriter<'c> {
         let key_len = key_bytes.len();
         let value_len = entry.len();
         let entry_offset = self.block_data.len();
-        let entry_size =
-            size_of::<u32>() // key length
-            + key_len
-            + 1 // presence bit (present or deleted)
-            + match entry {
-                &EntryValue::Present(_) => 
-                    size_of::<u32>() // value length
-                    + value_len,
-                &EntryValue::Deleted => 0
-            }
-            + size_of::<u32>() // byte offset for block footer
-            ;
+        let entry_size = Self::entry_size(key_len, entry, value_len);
         if self.size() + entry_size > self.db_config.block_max_size {
             return Err(SSTableError::BlockSizeOverflow);
         }
-        self.block_data.write_all(&(key_len as u32).to_le_bytes())?;
-        self.block_data.write_all(key_bytes)?;
-        match entry {
-            EntryValue::Present(value_bytes) => {
-                self.block_data.write_all(&1u8.to_le_bytes())?;
-                self.block_data.write_all(&(value_len as u32).to_le_bytes())?;
-                self.block_data.write_all(value_bytes)?;
-            }
-            EntryValue::Deleted => {
-                self.block_data.write_all(&0u8.to_le_bytes())?;
-            }
-        }
+        Self::write_entry(&mut self.block_data, key_len, key_bytes, entry, value_len)?;
 
         self.block_footer
             .write_all(&(entry_offset as u32).to_le_bytes())?;
         self.last_key = Some(key.to_string());
         Ok(entry_size)
+    }
+
+
+    fn entry_size(key_len: usize, entry: &EntryValue, value_len: usize) -> usize {
+        size_of::<u32>() // key length
+        + key_len
+        + 1 // presence bit (present or deleted)
+        + match entry {
+            &EntryValue::Present(_) => 
+                size_of::<u32>() // value length
+                + value_len,
+            &EntryValue::Deleted => 0
+        }
+        + size_of::<u32>() // byte offset for block footer
+    }
+
+    pub(crate) fn write_entry(
+        dest: &mut impl Write,
+        key_len: usize,
+        key_bytes: &[u8],
+        entry: &EntryValue,
+        value_len: usize,
+    ) -> Result<(), SSTableError> {
+        dest.write_all(&(key_len as u32).to_le_bytes())?;
+        dest.write_all(key_bytes)?;
+        Ok(match entry {
+            EntryValue::Present(value_bytes) => {
+                dest.write_all(&1u8.to_le_bytes())?;
+                dest.write_all(&(value_len as u32).to_le_bytes())?;
+                dest.write_all(value_bytes)?;
+            }
+            EntryValue::Deleted => {
+                dest.write_all(&0u8.to_le_bytes())?;
+            }
+        })
     }
 
     /// An estimated size of the block so far.
@@ -484,7 +522,7 @@ pub(crate) struct BlockReader<R: Read + Seek> {
     block_offset: u32,
     num_entries: u32,
     // entry_offsets: Vec<u32>,
-    entry_cursor: u32 // cursor for the next entry
+    entry_cursor: u32, // cursor for the next entry
 }
 
 impl<R: Read + Seek> BlockReader<R> {
@@ -501,11 +539,11 @@ impl<R: Read + Seek> BlockReader<R> {
         let mut entry_offsets = Vec::<u32>::with_capacity(num_entries as usize);
         reader.seek(SeekFrom::Start(
             (block_offset + block_size) as u64
-            -
-            (
-              BLOCK_NUM_ENTRIES_SIZEOF // rewind the num-of-entries field
-            + size_of::<u32>()*(num_entries as usize) // rewind the entry offset fields
-            ) as u64
+                - (
+                    BLOCK_NUM_ENTRIES_SIZEOF // rewind the num-of-entries field
+            + size_of::<u32>()*(num_entries as usize)
+                    // rewind the entry offset fields
+                ) as u64,
         ))?;
         // TODO:  reduce to just 1 read() using read_vectored(), or something custom
         for _ in 0..num_entries {
@@ -519,7 +557,7 @@ impl<R: Read + Seek> BlockReader<R> {
             block_offset,
             num_entries,
             // entry_offsets,
-            entry_cursor: 0
+            entry_cursor: 0,
         })
     }
 
@@ -530,7 +568,7 @@ impl<R: Read + Seek> BlockReader<R> {
         // TODO: do a binary search instead
         for i in 0..self.num_entries {
             self.entry_cursor = i;
-            let ((entry_key, _), entry_val) = (self.read_next_key()?, self.read_next_value()?);
+            let ((entry_key, _), entry_val) = (read_next_key(&mut self.reader)?, read_next_value(&mut self.reader)?);
             if key == entry_key {
                 return Ok(Some(entry_val));
             }
@@ -539,40 +577,16 @@ impl<R: Read + Seek> BlockReader<R> {
         Ok(None)
     }
 
-    // reads and returns the next key, along with total # of bytes read.
-    // NOTE: does not update the cursor
-    fn read_next_key(&mut self) -> Result<(Key, usize), SSTableError> {
-        let key_len: usize = self.reader.read_u32_le()? as usize;
-        Ok((String::from_utf8(self.reader.read_u8s(key_len)?)?, key_len + size_of::<u32>()))
-    }
-
-    // reads and returns the next value.
-    // NOTE: does not update the cursor
-    fn read_next_value(&mut self) -> Result<EntryValue, SSTableError> {
-        let is_present = self.reader.read_u8()?;
-        Ok(match is_present {
-            0 => EntryValue::Deleted,
-            1 => {
-                let val_len = self.reader.read_u32_le()? as usize;
-                let val = self.reader.read_u8s(val_len)?;
-                EntryValue::Present(val)
-            },
-            _ => {
-                return Err(SSTableError::Custom("invalid isPresent"));
-            }
-        })
-    }
-
     // To be used after seek().
     //
     // Reads the next entry and returns it, or returns SSTableError::EndOfBlock
-    pub fn read_next_entry(&mut self) -> Result<(Key,EntryValue), SSTableError> {
+    pub fn read_next_entry(&mut self) -> Result<(Key, EntryValue), SSTableError> {
         if self.entry_cursor >= self.num_entries {
             return Err(SSTableError::EndOfBlock);
         }
         self.entry_cursor += 1;
-        let (key, _) = self.read_next_key()?;
-        Ok((key, self.read_next_value()?))
+        let (key, _) = read_next_key(&mut self.reader)?;
+        Ok((key, read_next_value(&mut self.reader)?))
     }
 
     // Seeks the BlockReader's cursor to be at the first entry with prefix `key_prefix`
@@ -586,10 +600,11 @@ impl<R: Read + Seek> BlockReader<R> {
         // TODO: do a binary search instead
         for idx in 0..self.num_entries {
             self.entry_cursor = idx;
-            let (entry_key, bytes_read_for_key) = self.read_next_key()?;
+            let (entry_key, bytes_read_for_key) = read_next_key(&mut self.reader)?;
             if entry_key.starts_with(key_prefix) {
                 // rewind key we just read
-                self.reader.seek(SeekFrom::Current(-(bytes_read_for_key as i64)))?;
+                self.reader
+                    .seek(SeekFrom::Current(-(bytes_read_for_key as i64)))?;
                 return Ok(idx);
             }
             let is_present = self.reader.read_u8()?;
@@ -602,10 +617,36 @@ impl<R: Read + Seek> BlockReader<R> {
     }
 }
 
+
+// reads and returns the next key, along with total # of bytes read.
+pub(crate) fn read_next_key(reader: &mut impl Read) -> Result<(Key, usize), SSTableError> {
+    let key_len: usize = reader.read_u32_le()? as usize;
+    Ok((
+        String::from_utf8(reader.read_u8s(key_len)?)?,
+        key_len + size_of::<u32>(),
+    ))
+}
+
+// reads and returns the next value.
+pub(crate) fn read_next_value(reader: &mut impl Read) -> Result<EntryValue, SSTableError> {
+    let is_present = reader.read_u8()?;
+    Ok(match is_present {
+        0 => EntryValue::Deleted,
+        1 => {
+            let val_len = reader.read_u32_le()? as usize;
+            let val = reader.read_u8s(val_len)?;
+            EntryValue::Present(val)
+        }
+        _ => {
+            return Err(SSTableError::Custom("invalid isPresent"));
+        }
+    })
+}
+
 struct BlockIterator<'k, 'r, R: Read + Seek + 'r> {
     key_prefix: &'k String,
     block_reader: &'r mut BlockReader<R>,
-    is_empty: bool
+    is_empty: bool,
 }
 impl<'k, 'r, R: Read + Seek + 'r> Iterator for BlockIterator<'k, 'r, R> {
     type Item = (Key, Value);
@@ -615,15 +656,15 @@ impl<'k, 'r, R: Read + Seek + 'r> Iterator for BlockIterator<'k, 'r, R> {
             return None;
         }
         'next_present_key: loop {
-            match self.block_reader.read_next_key() {
+            match read_next_key(&mut self.block_reader.reader) {
                 Ok((next_key, _)) if next_key.starts_with(self.key_prefix) => {
-                    match self.block_reader.read_next_value() {
+                    match read_next_value(&mut self.block_reader.reader) {
                         Ok(EntryValue::Present(next_val)) => return Some((next_key, next_val)),
                         Ok(EntryValue::Deleted) => continue 'next_present_key,
-                        _ => return None
+                        _ => return None,
                     }
-                },
-                _ => break
+                }
+                _ => break,
             }
         }
         None
@@ -632,9 +673,12 @@ impl<'k, 'r, R: Read + Seek + 'r> Iterator for BlockIterator<'k, 'r, R> {
 
 #[cfg(test)]
 mod test {
-    use crate::db::{DBConfig, DB, sstable::{SSTableError, SSTableReader, BlockReader, BlockWriter}, EntryValue};
-    use std::{io::Cursor, fs::File, collections::HashMap};
+    use crate::db::{
+        sstable::{BlockReader, BlockWriter, SSTableError, SSTableReader},
+        DBConfig, EntryValue, DB,
+    };
     use rand::Rng;
+    use std::{collections::HashMap, fs::File, io::Cursor};
     use tempdir::TempDir;
 
     use super::SSTableWriter;
@@ -645,14 +689,20 @@ mod test {
         let mut buffer = Vec::new();
         let mut writer = BlockWriter::new(&db_config);
         writer
-            .push("/keyspace/keyname", &EntryValue::Present(b"value of the key".to_vec()))
+            .push(
+                "/keyspace/keyname",
+                &EntryValue::Present(b"value of the key".to_vec()),
+            )
             .expect("write to block");
         let (bytes_written, last_key) = writer.flush(&mut buffer).expect("write to buffer");
 
         let mut reader = BlockReader::new(Cursor::new(&buffer), 0, bytes_written.try_into()?)?;
         assert_eq!(
             reader.read_next_entry()?,
-            ("/keyspace/keyname".to_string(), EntryValue::Present(b"value of the key".to_vec()))
+            (
+                "/keyspace/keyname".to_string(),
+                EntryValue::Present(b"value of the key".to_vec())
+            )
         );
         assert_eq!(last_key, "/keyspace/keyname");
         assert_eq!(bytes_written, buffer.len());
@@ -745,7 +795,7 @@ mod test {
         db.put("/zzz", "a val").unwrap();
 
         // this should make enough keys
-        let mut expected_keys: Vec<String> = (0..100).map(|k| format!("/key/{}",k)).collect();
+        let mut expected_keys: Vec<String> = (0..100).map(|k| format!("/key/{}", k)).collect();
         expected_keys.sort();
         for key in &expected_keys {
             db.put(key, format!("v:{}", key)).unwrap();
@@ -763,9 +813,13 @@ mod test {
         assert_eq!(expected_keys.len(), actual_kvs.len());
 
         // assert that we can scan all of the keys
-        for (expected_key, (actual_key,actual_val)) in expected_keys.iter().zip(actual_kvs.iter()) {
+        for (expected_key, (actual_key, actual_val)) in expected_keys.iter().zip(actual_kvs.iter())
+        {
             assert_eq!(expected_key, actual_key);
-            assert_eq!(&EntryValue::Present(format!("v:{}", expected_key).to_string().into_bytes()), actual_val);
+            assert_eq!(
+                &EntryValue::Present(format!("v:{}", expected_key).to_string().into_bytes()),
+                actual_val
+            );
         }
     }
 
@@ -805,9 +859,8 @@ mod test {
         assert!(all_levels[0].len() == 1);
         for (_key_range, path) in all_levels[0] {
             // let mut file = std::fs::File::open(path.clone()).expect("couldnt open file");
-            let mut sstable =
-                SSTableReader::new(&tempdir.path().join(path))
-                    .unwrap_or_else(|_| panic!("couldnt open sstable {}", path));
+            let mut sstable = SSTableReader::new(&tempdir.path().join(path))
+                .unwrap_or_else(|_| panic!("couldnt open sstable {}", path));
             for i in 0..num_keys_to_generate {
                 // this key should exist
                 assert_eq!(
@@ -860,7 +913,7 @@ mod test {
             };
             ss_writer.push(&key, &val)?;
             expected.insert(key, val);
-        };
+        }
 
         ss_writer.flush()?;
 
@@ -868,8 +921,18 @@ mod test {
         let mut ss_reader = SSTableReader::new(&sstable_path).unwrap();
         assert_eq!(expected, ss_reader.scan("", false)?.collect());
 
-        let deleted_actual: HashMap<&String,&EntryValue> = expected.iter().filter(|&(_key,val)| val != &EntryValue::Deleted).collect();
-        assert_eq!(deleted_actual, ss_reader.scan("", true)?.collect::<HashMap<String,EntryValue>>().iter().collect());
+        let deleted_actual: HashMap<&String, &EntryValue> = expected
+            .iter()
+            .filter(|&(_key, val)| val != &EntryValue::Deleted)
+            .collect();
+        assert_eq!(
+            deleted_actual,
+            ss_reader
+                .scan("", true)?
+                .collect::<HashMap<String, EntryValue>>()
+                .iter()
+                .collect()
+        );
 
         // pick 500 random keys to read. some should've been deleted, some should exist.
         for _i in 0..500 {

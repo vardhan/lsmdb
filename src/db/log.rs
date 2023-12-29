@@ -1,40 +1,25 @@
 use std::{
     fs::{File, OpenOptions},
+    io::Read,
     io::Write,
     path::PathBuf,
 };
 
-use rmp_serde::Serializer;
 use serde::{Deserialize, Serialize};
 
 use thiserror::Error;
 
-use super::{EntryValue, Key};
+use super::{
+    sstable::{self, BlockWriter},
+    EntryValue, Key,
+};
 
 #[derive(Error, Debug)]
 pub(crate) enum LogError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    // #[error(transparent)]
-    // Utf8Error(#[from] Utf8Error),
-    // #[error(transparent)]
-    // FromUtf8Error(#[from] FromUtf8Error),
-    // #[error("block is too big. make a new block")]
-    // BlockSizeOverflow,
-    // #[error("no keys with prefix")]
-    // KeyPrefixNotFound,
-    // #[error("Reached the end of block")]
-    // EndOfBlock,
-    // // TODO:  Replace `Custom` with specific error codes
     #[error("Serialization error: {0}")]
     SerializeError(String),
-    // #[error("ManifestError: {0}")]
-    // ManifestError(String),
-}
-
-pub(crate) struct LogWriter {
-    path: PathBuf,
-    serializer: Serializer<File>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -43,17 +28,47 @@ struct LogEntry {
     value: EntryValue,
 }
 
+impl LogEntry {
+    fn serialize(&self, dest: &mut impl Write) -> Result<(), LogError> {
+        BlockWriter::write_entry(
+            dest,
+            self.key.len(),
+            self.key.as_bytes(),
+            &self.value,
+            match &self.value {
+                EntryValue::Present(val) => val.len(),
+                EntryValue::Deleted => 0,
+            },
+        )
+        .map_err(|err| LogError::SerializeError(err.to_string()))?;
+        Ok(())
+    }
+
+    fn deserialize(mut src: &mut impl Read) -> Result<LogEntry, LogError> {
+        let (key, _) = sstable::read_next_key(&mut src)
+            .map_err(|err| LogError::SerializeError(err.to_string()))?;
+
+        let value = sstable::read_next_value(src)
+            .map_err(|err| LogError::SerializeError(err.to_string()))?;
+
+        Ok(LogEntry { key, value })
+    }
+}
+
+pub(crate) struct LogWriter {
+    path: PathBuf,
+    writer: File,
+}
+
 impl LogWriter {
     pub(crate) fn new(path: &PathBuf) -> Result<LogWriter, LogError> {
         let writer = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path.clone())?;
-        let serializer = rmp_serde::Serializer::new(writer);
-        // .map_err(|err| DBError::LogError(err.to_string()))?;
         Ok(LogWriter {
             path: path.clone(),
-            serializer,
+            writer,
         })
     }
 
@@ -63,7 +78,7 @@ impl LogWriter {
             value: value.clone(),
         };
         entry
-            .serialize(&mut self.serializer)
+            .serialize(&mut self.writer)
             .map_err(|err| LogError::SerializeError(err.to_string()))?;
         Ok(())
     }
@@ -75,7 +90,7 @@ impl LogWriter {
             .open(&self.path)?;
         let mut new_self = LogWriter {
             path: self.path.clone(),
-            serializer: rmp_serde::Serializer::new(writer),
+            writer,
         };
         std::mem::swap(self, &mut new_self);
         Ok(())
@@ -98,7 +113,7 @@ impl Iterator for LogIterator {
     type Item = (Key, EntryValue);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match rmp_serde::from_read::<&File, LogEntry>(&self.reader)
+        match LogEntry::deserialize(&mut self.reader)
             .map_err(|err| LogError::SerializeError(err.to_string()))
         {
             Ok(entry) => Some((entry.key, entry.value)),
