@@ -447,7 +447,7 @@ impl<'c> BlockWriter<'c> {
         let key_len = key_bytes.len();
         let value_len = entry.len();
         let entry_offset = self.block_data.len();
-        let entry_size = Self::entry_size(key_len, entry, value_len);
+        let entry_size = Self::entry_size(key.as_bytes(), entry);
         if self.size() + entry_size > self.db_config.block_max_size {
             return Err(SSTableError::BlockSizeOverflow);
         }
@@ -459,16 +459,15 @@ impl<'c> BlockWriter<'c> {
         Ok(entry_size)
     }
 
-
-    fn entry_size(key_len: usize, entry: &EntryValue, value_len: usize) -> usize {
+    pub(crate) fn entry_size(key: &[u8], entry: &EntryValue) -> usize {
         size_of::<u32>() // key length
-        + key_len
+        + key.len()
         + 1 // presence bit (present or deleted)
-        + match entry {
-            &EntryValue::Present(_) => 
+        + match &entry {
+            EntryValue::Present(pentry) => 
                 size_of::<u32>() // value length
-                + value_len,
-            &EntryValue::Deleted => 0
+                + pentry.len(),
+            EntryValue::Deleted => 0
         }
         + size_of::<u32>() // byte offset for block footer
     }

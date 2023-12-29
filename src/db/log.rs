@@ -30,8 +30,10 @@ struct LogEntry {
 
 impl LogEntry {
     fn serialize(&self, dest: &mut impl Write) -> Result<(), LogError> {
+        let mut buf =
+            Vec::<u8>::with_capacity(BlockWriter::entry_size(self.key.as_bytes(), &self.value));
         BlockWriter::write_entry(
-            dest,
+            &mut buf,
             self.key.len(),
             self.key.as_bytes(),
             &self.value,
@@ -41,6 +43,8 @@ impl LogEntry {
             },
         )
         .map_err(|err| LogError::SerializeError(err.to_string()))?;
+
+        dest.write_all(buf.as_slice())?;
         Ok(())
     }
 
