@@ -6,9 +6,10 @@ use std::{
 
 use crate::db::{
     sstable::{SSTableError, SSTableReader},
+    types::EntryValue,
     Memtable,
 };
-use crate::db::{EntryValue, Key, Value};
+use crate::db::{Key, Value};
 
 // DBIteratorItem is an element in priority queue used for DB::scan().
 pub(crate) struct KeyEValueIteratorItem<'a>(

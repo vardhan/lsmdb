@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use thiserror::Error;
 /// Manifest file
 ///
 /// The manifest file is a log file which describes changes to the database file structure.
+/// It is different from the log file which describes changes to the database key-value space.
 ///
 /// When the database is opened, it consults the manifest file to figure out the list of all sstable
 /// files in each level, along with their key ranges. By replaying all of the manifest log, we can
@@ -90,9 +91,9 @@ pub(crate) enum ManifestOp {
 
 static CURRENT_FILENAME: &str = "CURRENT";
 impl Manifest {
-    pub(crate) fn open(root_dir: &PathBuf) -> Result<Manifest, ManifestError> {
+    pub(crate) fn open(root_dir: &Path) -> Result<Manifest, ManifestError> {
         if !root_dir.exists() {
-            std::fs::create_dir(root_dir.as_path())?;
+            std::fs::create_dir(root_dir)?;
         } else if !root_dir.is_dir() {
             return Err(ManifestError::InvalidRootDir);
         }
@@ -136,7 +137,7 @@ impl Manifest {
 
         manifest_file.seek(SeekFrom::End(0))?;
         Ok(Manifest {
-            root_dir: root_dir.clone(),
+            root_dir: root_dir.to_path_buf(),
             manifest_file,
             levels,
         })

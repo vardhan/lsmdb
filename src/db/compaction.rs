@@ -1,4 +1,7 @@
-use std::{cmp::Reverse, path::PathBuf};
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     db::manifest::KeyRange,
@@ -115,7 +118,7 @@ impl<'p, 'c> Compactor<'p, 'c> {
 }
 
 pub fn make_new_sstable_file(
-    root_dir: &PathBuf,
+    root_dir: &Path,
     level: u32,
 ) -> std::io::Result<(std::fs::File, PathBuf)> {
     let mut i = 0;

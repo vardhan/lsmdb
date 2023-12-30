@@ -4,12 +4,12 @@ use crate::db_iter::{
 };
 
 mod compaction;
-mod log;
 mod manifest;
 mod reader_ext;
 pub(crate) mod sstable;
+pub(crate) mod types;
+mod wal;
 
-use serde::{Deserialize, Serialize};
 use sstable::SSTableError;
 
 use std::{
@@ -19,12 +19,15 @@ use std::{
 };
 use thiserror::Error;
 
-use self::log::{LogIterator, LogWriter};
+use self::types::EntryValue;
 use self::{
     compaction::Compactor,
     manifest::{KeyRange, Manifest},
     sstable::{SSTableReader, SSTableWriter},
+    wal::{WALIterator, WALWriter},
 };
+pub type Key = String;
+pub type Value = Vec<u8>;
 
 #[derive(Error, Debug)]
 pub enum DBError {
@@ -50,25 +53,6 @@ pub enum DBError {
     LogError(String),
 }
 
-pub type Key = String;
-pub type Value = Vec<u8>;
-
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-pub enum EntryValue {
-    Present(Value),
-    Deleted,
-}
-
-impl EntryValue {
-    /// Returns the entry's size on disk.
-    pub fn len(&self) -> usize {
-        match self {
-            EntryValue::Present(value) => value.len(),
-            EntryValue::Deleted => 0,
-        }
-    }
-}
-
 pub(crate) type Memtable = BTreeMap<Key, EntryValue>;
 
 pub struct DB {
@@ -89,7 +73,7 @@ pub struct DB {
     sstables: Vec<VecDeque<(KeyRange, SSTableReader)>>,
 
     // Write ahead log.
-    log: LogWriter,
+    wal: WALWriter,
 
     // Active memtable, the latest source of data mutations
     active_memtable: Memtable,
@@ -124,25 +108,26 @@ impl DB {
     ///
     /// `root_dir` is the directory where data files will live.
     pub fn open_with_config(root_dir: &Path, config: DBConfig) -> Result<DB, DBError> {
-        let manifest = Manifest::open(&root_dir.to_path_buf())
+        let manifest = Manifest::open(root_dir)
             .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e)))?;
         let sstables = Self::open_all_sstables(&manifest)?;
         let log =
-            LogWriter::new(&root_dir.join("LOG")).map_err(|e| DBError::LogError(e.to_string()))?;
+            WALWriter::new(&root_dir.join("LOG")).map_err(|e| DBError::LogError(e.to_string()))?;
 
         let mut db = DB {
             root_dir: root_dir.into(),
             manifest,
             sstables,
-            log,
+            wal: log,
             active_memtable: BTreeMap::new(),
             active_memtable_size: 0,
             frozen_memtables: VecDeque::<Memtable>::new(),
             config,
         };
-        let log_iter = LogIterator::open(&root_dir.join("LOG"))
+        let log_iter = WALIterator::open(&root_dir.join("LOG"))
             .map_err(|err| DBError::LogError(err.to_string()))?;
         for (key, entry) in log_iter {
+            // TODO: flush into frozen memtables
             db.put_entry_into_active_memtable(key, entry);
         }
 
@@ -183,7 +168,6 @@ impl DB {
     pub fn get(&mut self, key: &str) -> Result<Option<Value>, DBError> {
         // first check the active memtable
         // if not in the active memtable, check the frozen memtables (newest first, and oldest last)
-        // we have to check the most recently frozen memtable first (the last element)
         for memtable in [&self.active_memtable]
             .into_iter()
             .chain(self.frozen_memtables.iter())
@@ -195,14 +179,14 @@ impl DB {
             };
         }
 
+        // Not in the memtables?  Lets try each sstable level.
+        // try level 0, then 1, etc. For each level, look up the sstable shard it could be on.
         let candidate_sstables = self.sstables.iter_mut().flat_map(|level_sstables| {
             level_sstables
                 .iter_mut()
                 .filter(|(range, _sstable)| key >= &range.smallest && key <= &range.largest)
                 .map(|(_, sstable)| sstable)
         });
-        // Not in the memtables?  Lets try each sstable level.
-        // try level 0, then 1, etc. For each level, look up the sstable shard it could be on.
         for sstable_reader in candidate_sstables {
             match sstable_reader
                 .get(key)
@@ -269,10 +253,11 @@ impl DB {
                 );
 
                 let mut heap = BinaryHeap::new();
-                let mut iter_precedence = 0; // 0 means newest
-                for db_iter in db_iters_peekable.into_iter() {
-                    heap.push(Reverse(KeyEValueIteratorItem(db_iter, iter_precedence)));
-                    iter_precedence += 1;
+                for (iter_precedence, db_iter) in db_iters_peekable.into_iter().enumerate() {
+                    heap.push(Reverse(KeyEValueIteratorItem(
+                        db_iter,
+                        iter_precedence as u32,
+                    )));
                 }
                 heap
             },
@@ -290,7 +275,7 @@ impl DB {
     }
 
     fn put_entry(&mut self, key: Key, entry: EntryValue) -> Result<(), DBError> {
-        self.log
+        self.wal
             .put(&key, &entry)
             .map_err(|err| DBError::LogError(err.to_string()))?;
 
@@ -304,7 +289,7 @@ impl DB {
             self.flush_frozen_memtables_to_sstable()
                 .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
 
-            self.log
+            self.wal
                 .clear()
                 .map_err(|log_err| DBError::LogError(log_err.to_string()))?;
 
@@ -394,7 +379,7 @@ impl DB {
             .iter_level_files(level)
             .map(
                 |(key_range, path)| -> Result<(KeyRange, SSTableReader), SSTableError> {
-                    Ok((key_range.clone(), SSTableReader::new(&path.clone().into())?))
+                    Ok((key_range.clone(), SSTableReader::new(Path::new(path))?))
                 },
             )
             .collect::<Result<VecDeque<_>, _>>()?;

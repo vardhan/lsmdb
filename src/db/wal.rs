@@ -1,100 +1,59 @@
 use std::{
     fs::{File, OpenOptions},
-    io::Read,
-    io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
-
-use serde::{Deserialize, Serialize};
 
 use thiserror::Error;
 
 use super::{
-    sstable::{self, BlockWriter},
-    EntryValue, Key,
+    types::{EntryValue, SerializableEntry, SerializableEntryError},
+    Key,
 };
 
+/// This file contains write-ahead-log functionality used by the database.
+/// Use [WALWriter] to append key-value changes to the log.
+/// Use [WALIterator] to iterate through all the key-values.
+
 #[derive(Error, Debug)]
-pub(crate) enum LogError {
+pub(crate) enum WALError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("Serialization error: {0}")]
-    SerializeError(String),
+    #[error(transparent)]
+    SerializableEntryError(#[from] SerializableEntryError),
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-struct LogEntry {
-    key: Key,
-    value: EntryValue,
-}
-
-impl LogEntry {
-    fn serialize(&self, dest: &mut impl Write) -> Result<(), LogError> {
-        let mut buf =
-            Vec::<u8>::with_capacity(BlockWriter::entry_size(self.key.as_bytes(), &self.value));
-        BlockWriter::write_entry(
-            &mut buf,
-            self.key.len(),
-            self.key.as_bytes(),
-            &self.value,
-            self.value.len(),
-        )
-        .map_err(|err| LogError::SerializeError(err.to_string()))?;
-
-        dest.write_all(buf.as_slice())?;
-        Ok(())
-    }
-
-    fn deserialize(mut src: &mut impl Read) -> Result<LogEntry, LogError> {
-        let (key, _) = sstable::read_next_key(&mut src)
-            .map_err(|err| LogError::SerializeError(err.to_string()))?;
-
-        let value = sstable::read_next_value(src)
-            .map_err(|err| LogError::SerializeError(err.to_string()))?;
-
-        Ok(LogEntry { key, value })
-    }
-}
-
-pub(crate) struct LogWriter {
+/// WALWriter appends key-value entries to a log file. This is used for implementing a write-ahead-log.
+/// To read out all the key-values in a log, use [WALIterator].
+pub(crate) struct WALWriter {
     path: PathBuf,
     writer: File,
 }
 
-/// LogWriter appends key-value to the end of a log file.  This is used for implementing write-ahead-logging.
-/// To read out all the key-values in a log, use [LogIterator].
-impl LogWriter {
+impl WALWriter {
     /// Creates or re-opens log file.
-    pub(crate) fn new(path: &PathBuf) -> Result<LogWriter, LogError> {
-        let writer = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.clone())?;
-        Ok(LogWriter {
-            path: path.clone(),
-            writer,
+    pub(crate) fn new(path: &Path) -> Result<WALWriter, WALError> {
+        Ok(WALWriter {
+            path: path.to_path_buf(),
+            writer: OpenOptions::new().create(true).append(true).open(path)?,
         })
     }
 
     /// Appends the (key, value) to the end of the log
-    pub(crate) fn put(&mut self, key: &Key, value: &EntryValue) -> Result<(), LogError> {
-        let entry = LogEntry {
+    pub(crate) fn put(&mut self, key: &Key, value: &EntryValue) -> Result<(), WALError> {
+        Ok(SerializableEntry {
             key: key.to_string(),
             value: value.clone(),
-        };
-        entry
-            .serialize(&mut self.writer)
-            .map_err(|err| LogError::SerializeError(err.to_string()))?;
-        Ok(())
+        }
+        .serialize_buffered(&mut self.writer)?)
     }
 
     /// Clears the contents of the log file -- there will be no entries after this.
-    pub(crate) fn clear(&mut self) -> Result<(), LogError> {
+    pub(crate) fn clear(&mut self) -> Result<(), WALError> {
         let writer = OpenOptions::new()
             .truncate(true)
             .write(true)
             .open(&self.path)?;
-        let mut new_self = LogWriter {
+        let mut new_self = WALWriter {
             path: self.path.clone(),
             writer,
         };
@@ -103,27 +62,25 @@ impl LogWriter {
     }
 }
 
-pub(crate) struct LogIterator {
+/// WALIterator provides an API to read all the key-value entries in a log.
+pub(crate) struct WALIterator {
     reader: File,
 }
 
-/// LogIterator provides an API to read all the key-value entries in a log.
-impl LogIterator {
-    // After calling open(), LogIterator can be used as an iterator to read each key-value entry.
-    pub(crate) fn open(path: &PathBuf) -> Result<LogIterator, LogError> {
-        Ok(LogIterator {
+impl WALIterator {
+    /// After calling open(), WALIterator can be used as an iterator to read each key-value entry.
+    pub(crate) fn open(path: &PathBuf) -> Result<WALIterator, WALError> {
+        Ok(WALIterator {
             reader: OpenOptions::new().read(true).open(path)?,
         })
     }
 }
 
-impl Iterator for LogIterator {
+impl Iterator for WALIterator {
     type Item = (Key, EntryValue);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match LogEntry::deserialize(&mut self.reader)
-            .map_err(|err| LogError::SerializeError(err.to_string()))
-        {
+        match SerializableEntry::deserialize(&mut self.reader) {
             Ok(entry) => Some((entry.key, entry.value)),
             _ => None,
         }
@@ -134,15 +91,16 @@ impl Iterator for LogIterator {
 mod test {
     use tempdir::TempDir;
 
-    use crate::db::{EntryValue, Key};
+    use crate::db::types::EntryValue;
+    use crate::db::Key;
 
-    use super::{LogIterator, LogWriter};
+    use super::{WALIterator, WALWriter};
 
     #[test]
     fn test_put_iterate_clear() -> anyhow::Result<()> {
         let tmp_dir = TempDir::new("db1")?;
         let tmp_log = tmp_dir.path().join("LOG");
-        let mut logger = LogWriter::new(&tmp_log)?;
+        let mut logger = WALWriter::new(&tmp_log)?;
 
         logger.put(
             &"key1".to_string(),
@@ -154,7 +112,7 @@ mod test {
         )?;
         logger.put(&"key3".to_string(), &EntryValue::Deleted)?;
 
-        let entries = LogIterator::open(&tmp_log)?.collect::<Vec<(Key, EntryValue)>>();
+        let entries = WALIterator::open(&tmp_log)?.collect::<Vec<(Key, EntryValue)>>();
         assert_eq!(
             entries,
             vec![
@@ -176,7 +134,7 @@ mod test {
             &EntryValue::Present("val4".as_bytes().to_vec()),
         )?;
 
-        let entries = LogIterator::open(&tmp_log)?.collect::<Vec<(Key, EntryValue)>>();
+        let entries = WALIterator::open(&tmp_log)?.collect::<Vec<(Key, EntryValue)>>();
         assert_eq!(
             entries,
             vec![(
@@ -193,7 +151,7 @@ mod test {
         let tmp_dir = TempDir::new("db1")?;
         let tmp_log = tmp_dir.path().join("LOG");
 
-        let mut logger = LogWriter::new(&tmp_log)?;
+        let mut logger = WALWriter::new(&tmp_log)?;
         logger.put(
             &"key1".to_string(),
             &EntryValue::Present("val1".as_bytes().to_vec()),
@@ -204,12 +162,12 @@ mod test {
         )?;
 
         std::mem::drop(logger);
-        let mut logger = LogWriter::new(&tmp_log)?;
+        let mut logger = WALWriter::new(&tmp_log)?;
         logger.put(&"key3".to_string(), &EntryValue::Deleted)?;
 
         std::mem::drop(logger);
 
-        let entries = LogIterator::open(&tmp_log)?.collect::<Vec<(Key, EntryValue)>>();
+        let entries = WALIterator::open(&tmp_log)?.collect::<Vec<(Key, EntryValue)>>();
         assert_eq!(
             entries,
             vec![

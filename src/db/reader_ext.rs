@@ -21,9 +21,8 @@ impl<T: Read> ReaderExt for T {
     }
 
     fn read_u8s(&mut self, length: usize) -> Result<Vec<u8>, std::io::Error> {
-        let mut bytes = Vec::<u8>::new();
-        bytes.resize(length, 0);
-        self.read(bytes.as_mut_slice())?;
+        let mut bytes = vec![0; length];
+        self.read_exact(bytes.as_mut_slice())?;
         Ok(bytes)
     }
 }
