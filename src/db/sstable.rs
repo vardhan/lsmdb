@@ -10,7 +10,7 @@ use std::{
 use memmap2::Mmap;
 use thiserror::Error;
 
-use crate::db::{types::EntryValue, DBConfig, Key, Value};
+use crate::db::{types::EntryValue, DBConfig, Key};
 
 use super::{
     reader_ext::ReaderExt,
@@ -585,34 +585,6 @@ impl<R: Read + Seek> BlockReader<R> {
             }
         }
         Err(SSTableError::KeyPrefixNotFound)
-    }
-}
-
-struct BlockIterator<'k, 'r, R: Read + Seek + 'r> {
-    key_prefix: &'k String,
-    block_reader: &'r mut BlockReader<R>,
-    is_empty: bool,
-}
-impl<'k, 'r, R: Read + Seek + 'r> Iterator for BlockIterator<'k, 'r, R> {
-    type Item = (Key, Value);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.is_empty {
-            return None;
-        }
-        'next_present_key: loop {
-            match SerializableEntry::read_next_key(&mut self.block_reader.reader) {
-                Ok((next_key, _)) if next_key.starts_with(self.key_prefix) => {
-                    match SerializableEntry::read_next_value(&mut self.block_reader.reader) {
-                        Ok(EntryValue::Present(next_val)) => return Some((next_key, next_val)),
-                        Ok(EntryValue::Deleted) => continue 'next_present_key,
-                        _ => return None,
-                    }
-                }
-                _ => break,
-            }
-        }
-        None
     }
 }
 
