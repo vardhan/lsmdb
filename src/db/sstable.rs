@@ -453,7 +453,7 @@ impl<'c> BlockWriter<'c> {
         if self.size() + entry_size > self.db_config.block_max_size {
             return Err(SSTableError::BlockSizeOverflow);
         }
-        SerializableEntry::serialize_unbuffered(&mut self.block_data, key.as_bytes(), entry)?;
+        SerializableEntry::serialize(&mut self.block_data, key.as_bytes(), entry)?;
 
         self.block_footer
             .write_all(&(entry_offset as u32).to_le_bytes())?;

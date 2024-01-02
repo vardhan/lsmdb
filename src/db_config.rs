@@ -2,7 +2,7 @@
 pub struct DBConfig {
     /// Size threshold for a memtable (counts key & value sizes)
     pub max_active_memtable_size: usize,
-    /// Max number of frozen memtables before they are force-flushed to sstable
+    /// Max number of frozen memtables we can accomodate
     pub max_frozen_memtables: usize,
     /// Size threshold for a block (counts all bytes in a block)
     pub block_max_size: usize,

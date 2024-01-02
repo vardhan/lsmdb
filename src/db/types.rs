@@ -45,25 +45,10 @@ pub(crate) struct SerializableEntry {
 }
 
 impl SerializableEntry {
-    /// Writes this entry's key and value into `dest`.
+    /// Writes the given key and value into `dest`.
     ///
-    /// This method first serializes into a memory buffer before writing the buffer into `dest`.
-    /// This is done in order to save on the write() calls to `dest`, which may be expensive if backed by disk.
-    ///
-    /// If you want to serialize without buffering, use [serialize_unbuffered].
-    pub fn serialize_buffered(&self, dest: &mut impl Write) -> Result<(), SerializableEntryError> {
-        // Serialize into a buffer first, instead of directly into `dest`. Useful
-        // in case `dest`` is a File, which would incur lots of write() syscalls.
-        let mut buf = Vec::<u8>::with_capacity(Self::entry_size(self.key.as_bytes(), &self.value));
-        Self::serialize_unbuffered(&mut buf, self.key.as_bytes(), &self.value)
-            .map_err(|err| SerializableEntryError::SerializeError(err.to_string()))?;
-
-        dest.write_all(buf.as_slice())?;
-        Ok(())
-    }
-
-    /// Writes the given key and value into `dest` without buffering into memory first.
-    pub fn serialize_unbuffered(
+    /// Performs multiple write() calls, so its the caller's responsibility make `dest` a buffer for better performance.
+    pub fn serialize(
         dest: &mut impl Write,
         key: &[u8],
         value: &EntryValue,

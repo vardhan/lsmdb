@@ -20,6 +20,7 @@ use std::{
 use thiserror::Error;
 
 use self::types::EntryValue;
+use self::wal::WALEntry;
 use self::{
     compaction::Compactor,
     manifest::{KeyRange, Manifest},
@@ -49,8 +50,8 @@ pub enum DBError {
     #[error("ManifestError: {0}")]
     ManifestError(String),
 
-    #[error("LogError: {0}")]
-    LogError(String),
+    #[error("write-ahead log Error: {0}")]
+    WALError(String),
 }
 
 pub(crate) type Memtable = BTreeMap<Key, EntryValue>;
@@ -59,7 +60,7 @@ pub struct DB {
     // Database files (SSTables, manifest) are stored under the directory `root_dir`
     root_dir: PathBuf,
 
-    // Manifest describing where all the persistent data is.
+    // Manifest describes where all the persisted data files live.
     pub(crate) manifest: Manifest,
 
     // Opened SSTable readers.
@@ -87,7 +88,7 @@ pub struct DB {
     // memtable is not mutable, and will be flushed to an SSTable file
     // and removed from this list.
     //
-    // The first element is the oldest memtable, the last is the newest.
+    // The first element is the newest memtable, the last is the oldest.
     frozen_memtables: VecDeque<Memtable>,
 
     config: DBConfig,
@@ -108,28 +109,22 @@ impl DB {
     ///
     /// `root_dir` is the directory where data files will live.
     pub fn open_with_config(root_dir: &Path, config: DBConfig) -> Result<DB, DBError> {
-        let manifest = Manifest::open(root_dir)
+        let mut manifest = Manifest::open(root_dir)
             .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e)))?;
         let sstables = Self::open_all_sstables(&manifest)?;
-        let log =
-            WALWriter::new(&root_dir.join("LOG")).map_err(|e| DBError::LogError(e.to_string()))?;
+        let wal = Self::init_wal(&root_dir, &mut manifest)?;
 
         let mut db = DB {
             root_dir: root_dir.into(),
             manifest,
             sstables,
-            wal: log,
+            wal,
             active_memtable: BTreeMap::new(),
             active_memtable_size: 0,
             frozen_memtables: VecDeque::<Memtable>::new(),
             config,
         };
-        let log_iter = WALIterator::open(&root_dir.join("LOG"))
-            .map_err(|err| DBError::LogError(err.to_string()))?;
-        for (key, entry) in log_iter {
-            // TODO: flush into frozen memtables
-            db.put_entry_into_active_memtable(key, entry);
-        }
+        db.init_memtables_from_logs()?;
 
         Ok(db)
     }
@@ -160,6 +155,52 @@ impl DB {
             levels.push(readers);
         }
         Ok(levels)
+    }
+
+    // Initializes the writer for the current log, or creates one if it doesn't exist.
+    fn init_wal(root_dir: &Path, manifest: &mut Manifest) -> Result<WALWriter, DBError> {
+        let current_log_filename = match manifest.current_log() {
+            Some(log_filename) => log_filename.clone(),
+            None => {
+                // This is the first time opening this database.
+                // Make a new log and record it in the manifest.
+                let (_, log_filename) = WALWriter::make_new_log(root_dir)
+                    .map_err(|e| DBError::WALError(e.to_string()))?;
+                manifest
+                    .new_log(log_filename.clone())
+                    .map_err(|e| DBError::ManifestError(e.to_string()))?;
+                log_filename
+            }
+        };
+
+        Ok(WALWriter::new(&root_dir, &current_log_filename)
+            .map_err(|e| DBError::WALError(e.to_string()))?)
+    }
+
+    // Initializes the frozen memtables and active memtable from the WAL logs.
+    fn init_memtables_from_logs(&mut self) -> Result<(), DBError> {
+        for (log_no, log_filename) in self.manifest.logs.clone().iter().enumerate() {
+            let wal_iter =
+                WALIterator::open(&self.root_dir.join(&log_filename)).map_err(|err| {
+                    DBError::WALError(format!(
+                        "Could not iterate log file {:?}: {}",
+                        log_filename,
+                        err.to_string()
+                    ))
+                })?;
+            for entry in wal_iter {
+                match entry {
+                    WALEntry::Put(key, value) => {
+                        self.put_entry_into_active_memtable(key, value);
+                    }
+                }
+            }
+            // Freeze the active memtable if there are more logs to process.
+            if log_no < self.manifest.logs.len() - 1 {
+                self.move_active_memtable_to_frozen();
+            }
+        }
+        Ok(())
     }
 
     /// get() looks up the value of the given `key`.
@@ -277,7 +318,7 @@ impl DB {
     fn put_entry(&mut self, key: Key, entry: EntryValue) -> Result<(), DBError> {
         self.wal
             .put(&key, &entry)
-            .map_err(|err| DBError::LogError(err.to_string()))?;
+            .map_err(|err| DBError::WALError(err.to_string()))?;
 
         self.put_entry_into_active_memtable(key, entry);
         if self.active_memtable_size >= self.config.max_active_memtable_size {
@@ -288,10 +329,6 @@ impl DB {
         if self.frozen_memtables.len() > self.config.max_frozen_memtables {
             self.flush_frozen_memtables_to_sstable()
                 .map_err(|sstable_err| DBError::SSTable(sstable_err.to_string()))?;
-
-            self.wal
-                .clear()
-                .map_err(|log_err| DBError::LogError(log_err.to_string()))?;
 
             // is L0 too big?
             self.compact_if_l0_full()?;
@@ -400,13 +437,27 @@ impl DB {
             .sum()
     }
 
-    pub(crate) fn freeze_active_memtable(&mut self) -> Result<(), SSTableError> {
+    /// Freezes active memtable and rotates to a new WAL log.
+    pub(crate) fn freeze_active_memtable(&mut self) -> Result<(), DBError> {
+        self.move_active_memtable_to_frozen();
+
+        // rotate log and record it in the manifest.
+        let new_log_filename = self
+            .wal
+            .rotate_log()
+            .map_err(|err| DBError::WALError(format!("Could not rotate log: {}", err)))?;
+
+        self.manifest.new_log(new_log_filename).map_err(|err| {
+            DBError::ManifestError(format!("Could not record new log in manifest: {}", err))
+        })?;
+
+        Ok(())
+    }
+
+    pub fn move_active_memtable_to_frozen(&mut self) {
         self.frozen_memtables
             .push_front(std::mem::take(&mut self.active_memtable));
         self.active_memtable_size = 0;
-
-        // rotate logs
-        Ok(())
     }
 
     /// Flushes the set of frozen memtables into a set of L0 sstables.
@@ -465,6 +516,12 @@ impl DB {
 
         // remove all frozen memtables; From now on, DB::get() will query the sstable instead.
         self.frozen_memtables.clear();
+
+        // remove the frozen memtable logs;  leave the active memtable log, though.
+        while self.manifest.logs.len() > 1 {
+            let filename = self.manifest.logs.pop_front().unwrap();
+            std::fs::remove_file(self.root_dir.join(filename))?;
+        }
 
         Ok(())
     }
@@ -659,6 +716,8 @@ mod test {
         )
         .expect("couldnt make db");
 
+        assert_eq!(db.manifest.logs.len(), 1);
+
         // one key per frozen memtable:
         let keys = vec!["a", "b", "c", "d", "e", "f"];
         for key in &keys {
@@ -668,12 +727,14 @@ mod test {
                 .expect("couldnt freeze active memtables");
         }
         assert_eq!(db.frozen_memtables.len(), keys.len());
+        assert_eq!(db.manifest.logs.len(), keys.len() + 1); // `keys.len()` frozen memtables and an active memtable
 
         // every frozen memtable turns into an sstable
         db.flush_frozen_memtables_to_sstable()
             .expect("couldnt flush frozen memtables");
 
         assert_eq!(db.sstables[0].len(), keys.len());
+        assert_eq!(db.manifest.logs.len(), 1); // only for the active memtable
 
         // sstables should now be persisted -- test that they are accessible when db is re-opened
         db.close();
@@ -687,6 +748,7 @@ mod test {
         )
         .expect("couldnt reopen db");
         assert_eq!(db.sstables[0].len(), keys.len());
+        assert_eq!(db.manifest.logs.len(), 1); // only for the active memtable
 
         // check that each sstable has the correct key, and doesn't have any of the other keys.
         for (i, key) in keys.iter().rev().enumerate() {
@@ -877,8 +939,9 @@ mod test {
 
     #[test]
     fn test_resume_open_close() -> anyhow::Result<()> {
-        // test the WAL:
-        // - test that closing a database and opening it up again retains keys and values
+        // Test that closing a database and opening it up again retains keys and values:
+        // - test that active memtable contains the same keys as before closing
+        // - test that all frozen memtables exists.
         let tmpdir = tempdir::TempDir::new("lsmdb")?;
         let mut db = DB::open_with_config(
             tmpdir.path(),
@@ -899,6 +962,13 @@ mod test {
         assert_eq!(db.sstables.len(), 0); // there are no sstables
 
         // now close the database and open it up again -- test that all the data is there.
+        let expected_active_memtable_len = db.active_memtable.len();
+        let expected_active_memtable_size = db.active_memtable_size;
+        let expected_frozen_memtable_lens = db
+            .frozen_memtables
+            .iter()
+            .map(|memtable| memtable.len())
+            .collect::<Vec<_>>();
         db.close();
         db = DB::open_with_config(
             tmpdir.path(),
@@ -909,7 +979,15 @@ mod test {
             },
         )?;
 
-        assert!(!db.active_memtable.is_empty());
+        assert_eq!(db.active_memtable.len(), expected_active_memtable_len);
+        assert_eq!(db.active_memtable_size, expected_active_memtable_size);
+        assert_eq!(
+            db.frozen_memtables
+                .iter()
+                .map(|memtable| memtable.len())
+                .collect::<Vec<_>>(),
+            expected_frozen_memtable_lens
+        );
         assert_eq!(db.sstables.len(), 0);
 
         // check that the keys we made earlier still exist:
