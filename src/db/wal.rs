@@ -35,10 +35,10 @@ impl WALEntry {
             WALEntry::Put(key, value) => {
                 let mut buf: Vec<u8> = Vec::<u8>::with_capacity(
                     1 /* op code */
-                        + SerializableEntry::entry_size(key.as_bytes(), &value),
+                        + SerializableEntry::entry_size(key.as_bytes(), value),
                 );
                 buf.write_all(&[self.to_code()])?;
-                SerializableEntry::serialize(&mut buf, key.as_bytes(), &value)?;
+                SerializableEntry::serialize(&mut buf, key.as_bytes(), value)?;
 
                 dest.write_all(&buf)?;
             }
@@ -49,7 +49,7 @@ impl WALEntry {
 
     pub(crate) fn deserialize(mut src: &mut impl Read) -> Result<WALEntry, WALError> {
         let mut op = vec![0u8; 1];
-        src.read(&mut op)?;
+        src.read_exact(&mut op)?;
 
         match op[0] {
             0 => {

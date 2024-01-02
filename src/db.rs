@@ -112,7 +112,7 @@ impl DB {
         let mut manifest = Manifest::open(root_dir)
             .map_err(|e| DBError::ManifestError(format!("manifest err: {}", e)))?;
         let sstables = Self::open_all_sstables(&manifest)?;
-        let wal = Self::init_wal(&root_dir, &mut manifest)?;
+        let wal = Self::init_wal(root_dir, &mut manifest)?;
 
         let mut db = DB {
             root_dir: root_dir.into(),
@@ -173,19 +173,19 @@ impl DB {
             }
         };
 
-        Ok(WALWriter::new(&root_dir, &current_log_filename)
-            .map_err(|e| DBError::WALError(e.to_string()))?)
+        WALWriter::new(root_dir, &current_log_filename)
+            .map_err(|e| DBError::WALError(e.to_string()))
     }
 
     // Initializes the frozen memtables and active memtable from the WAL logs.
     fn init_memtables_from_logs(&mut self) -> Result<(), DBError> {
         for (log_no, log_filename) in self.manifest.logs.clone().iter().enumerate() {
             let wal_iter =
-                WALIterator::open(&self.root_dir.join(&log_filename)).map_err(|err| {
+                WALIterator::open(&self.root_dir.join(log_filename)).map_err(|err| {
                     DBError::WALError(format!(
                         "Could not iterate log file {:?}: {}",
                         log_filename,
-                        err.to_string()
+                        err
                     ))
                 })?;
             for entry in wal_iter {

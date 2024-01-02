@@ -152,7 +152,7 @@ mod test {
     // where each sstable file has almost a max amount of keys. Keys in
     // each sstable are sorted and non-overlapping with other sstables.
     fn generate_sstables(
-        root_dir: &PathBuf,
+        root_dir: &Path,
         db_config: &DBConfig,
         num_files: i32,
         max_bytes_per_file: usize,

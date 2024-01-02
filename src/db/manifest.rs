@@ -273,7 +273,7 @@ mod test {
     #[test]
     fn empty() -> anyhow::Result<()> {
         let tmp = TempDir::new("db")?;
-        let _manifest = Manifest::open(&tmp.path().to_path_buf())?;
+        let _manifest = Manifest::open(tmp.path())?;
         let expect = vec!["MANIFEST-0".to_string(), "CURRENT".to_string()];
         let actual = tmp
             .path()
@@ -300,7 +300,7 @@ mod test {
             tmp.path().join("MANIFEST-42"),
             [r#"{"NewLog":{"filename":"LOG.0"}}"#].join("\n"),
         )?;
-        let mut manifest = Manifest::open(&tmp.path().to_path_buf())?;
+        let mut manifest = Manifest::open(tmp.path())?;
         assert_eq!(Some(&"LOG.0".to_string()), manifest.current_log());
 
         manifest.new_log("LOG.1".to_string())?;
@@ -390,7 +390,7 @@ mod test {
                     r#"{"AddSSTable":{"key_range":{"smallest":"/abc","largest":"/def"},"sstable":"0.sst"}}"#]
                 .join("\n"),
         )?;
-        let manifest = Manifest::open(&tmp.path().to_path_buf())?;
+        let manifest = Manifest::open(tmp.path())?;
         // assert that the sstables in level 0 are not re-ordered.
         assert_eq!(
             vec![vec![
@@ -445,9 +445,9 @@ mod test {
                 .join("\n"),
         )?;
         // `manifest` is used to test that the JSON input was parsed out correctly
-        let manifest = Manifest::open(&tmp1.path().to_path_buf())?;
+        let manifest = Manifest::open(tmp1.path())?;
         // `manifest2` is populated to be the same as `manifest`, but using the `Manifest` API.
-        let mut manifest2 = Manifest::open(&tmp2.path().to_path_buf())?;
+        let mut manifest2 = Manifest::open(tmp2.path())?;
         manifest2.new_log("LOG.0".to_string())?;
         manifest2.new_log("LOG.1".to_string())?;
         manifest2.add_sstable_l0(

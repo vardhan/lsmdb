@@ -112,7 +112,7 @@ fn readseq(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTim
             for _i in 0..num_iterations {
                 match iter.next() {
                     Some((_key, _value)) => {
-                        1;
+                        continue;
                     }
                     None => {
                         std::mem::drop(iter);
